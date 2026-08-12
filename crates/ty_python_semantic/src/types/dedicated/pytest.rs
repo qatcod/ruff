@@ -42,14 +42,14 @@ use itertools::Either;
 use ruff_db::files::system_path_to_file;
 use ruff_db::parsed::{ParsedModuleRef, parsed_module};
 use ruff_python_ast::{self as ast, name::Name};
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use ty_module_resolver::{
     ImportingFile, KnownModule, ModuleName, file_to_module, resolve_module_for_import_from,
     resolve_real_module_confident, stub_file_to_real_module,
 };
 use ty_python_core::ast_node_ref::AstNodeRef;
 use ty_python_core::definition::{Definition, DefinitionKind, ParameterDefinitionNodeKind};
-use ty_python_core::scope::{FileScopeId, ScopeId, ScopeKind};
+use ty_python_core::scope::{FileScopeId, NodeWithScopeKind, ScopeId, ScopeKind};
 use ty_python_core::{
     Program, ProgramFile, global_scope, place_table, semantic_index, use_def_map,
 };
@@ -225,6 +225,15 @@ impl<'db> FixtureBinding<'db> {
     }
 }
 
+/// Returns non-project files that should be searched for pytest fixture references.
+#[expect(dead_code, reason = "used by the follow-up IDE integration")]
+fn fixture_reference_search_files<'db>(
+    db: &'db dyn Db,
+    program: Program<'db>,
+) -> &'db [ProgramFile<'db>] {
+    pytest_global_plugin_files(db, program)
+}
+
 /// Returns the installed core pytest plugin files in registration order.
 fn pytest_global_plugin_files<'db>(
     db: &'db dyn Db,
@@ -324,6 +333,161 @@ fn pytest_legacy_tmpdir_plugin<'db>(
     } else {
         None
     }
+}
+
+/// Returns definitions in `file` that can participate in pytest fixture references.
+///
+/// A candidate is one of:
+///
+/// - the function definition of an available fixture;
+/// - a runtime import or stub definition that exposes an available fixture; or
+/// - a non-variadic parameter that represents a fixture request on a collected test or available
+///   fixture function.
+#[salsa::tracked(returns(ref), heap_size=ruff_memory_usage::heap_size)]
+fn fixture_reference_candidates<'db>(
+    db: &'db dyn Db,
+    file: ProgramFile<'db>,
+) -> Box<[Definition<'db>]> {
+    let module = parsed_module(db, file.python_file(db)).load(db);
+    let index = semantic_index(db, file);
+    let is_stub = file.file(db).is_stub(db);
+    let mut candidates = FxIndexSet::default();
+    let mut available_functions = FxHashSet::default();
+    let mut search_scope_availability = FxHashMap::default();
+
+    // First collect functions that remain bound in available search scopes and the definitions
+    // that expose fixtures from those scopes.
+    for scope_id in index.scope_ids() {
+        let file_scope = scope_id.file_scope_id(db);
+        if !is_available_fixture_search_scope(db, index, file_scope, &mut search_scope_availability)
+        {
+            continue;
+        }
+
+        let table = index.place_table(file_scope);
+        let use_def = index.use_def_map(file_scope);
+        for (symbol_id, bindings) in use_def.all_end_of_scope_symbol_bindings() {
+            let symbol_name = table.symbol(symbol_id).name();
+            let resolution = DefinitionResolution::from_bindings(db, bindings);
+            for definition in resolution.definitions().iter().copied() {
+                if definition.program_file(db) != file {
+                    continue;
+                }
+                if matches!(definition.kind(db), DefinitionKind::Function(_)) {
+                    if exists_at_runtime(db, definition) {
+                        available_functions.insert(definition);
+
+                        if !is_stub && fixture_declaration(db, definition).is_some() {
+                            candidates.insert(definition);
+                        }
+                    }
+
+                    if !is_stub {
+                        continue;
+                    }
+                }
+
+                if fixture_candidates_from_definition(db, definition, symbol_name)
+                    .iter()
+                    .any(|fixture| fixture_declaration(db, *fixture).is_some())
+                {
+                    candidates.insert(definition);
+                }
+            }
+        }
+    }
+
+    // Then collect requests from functions whose availability is now known.
+    for scope_id in index.scope_ids() {
+        let file_scope = scope_id.file_scope_id(db);
+        let scope = index.scope(file_scope);
+        let NodeWithScopeKind::Function(function_ref) = scope.node() else {
+            continue;
+        };
+        let function = function_ref.node(&module);
+        let owner = index.expect_single_definition(function_ref);
+        let mut parameters = function.parameters.iter_non_variadic_params().peekable();
+        if parameters.peek().is_none() || !available_functions.contains(&owner) {
+            continue;
+        }
+        let Some(parent_scope) = FixtureRequestContext::parent_scope(index, file_scope) else {
+            continue;
+        };
+        let class_scope = parent_scope.class_scope();
+        let Some(context) =
+            FixtureRequestContext::new(db, function_ref, class_scope, &module, index)
+        else {
+            continue;
+        };
+
+        for parameter in parameters {
+            let definition = index.expect_single_definition(parameter);
+            if context
+                .fixture_request_for_parameter(db, definition)
+                .is_some()
+            {
+                candidates.insert(definition);
+            }
+        }
+    }
+
+    candidates.into_iter().collect()
+}
+
+/// Returns the fixture function definitions that represent the target reference
+/// identity for the given `definition`.
+///
+/// `definition` can be any of the following:
+///
+/// - a test or fixture function parameter
+/// - a fixture function definition
+/// - an import or stub definition
+///
+/// Each of those is mapped to the common identity of the set of fixture
+/// function definitions that they request, expose or originate from. That set
+/// can then be intersected with the `fixture_reference_identities` of a different
+/// definition, to determine if the two belong to the same reference family.
+#[salsa::tracked(returns(ref), heap_size=ruff_memory_usage::heap_size)]
+fn fixture_reference_identities<'db>(
+    db: &'db dyn Db,
+    definition: Definition<'db>,
+) -> Box<[Definition<'db>]> {
+    // Resolve a parameter.
+    if matches!(definition.kind(db), DefinitionKind::Parameter(_)) {
+        if !is_available_fixture_request_parameter(db, definition) {
+            return Box::default();
+        }
+        return fixture_bindings_for_parameter(db, definition)
+            .iter()
+            .map(|binding| binding.fixture())
+            .collect();
+    }
+
+    // Ensure that the (arbitrary) definition passed to this function remains available in a
+    // fixture search scope (otherwise it should not resolve to a fixture).
+    let index = semantic_index(db, definition.program_file(db));
+    let definition_scope = definition.file_scope(db);
+    let mut search_scope_availability = FxHashMap::default();
+    if !is_available_fixture_search_scope(
+        db,
+        index,
+        definition_scope,
+        &mut search_scope_availability,
+    ) || !is_available_definition_in_scope(db, index, definition_scope, definition)
+    {
+        return Box::default();
+    }
+
+    let Some(symbol) = definition.place(db).as_symbol() else {
+        return Box::default();
+    };
+    let name = place_table(db, definition.scope(db)).symbol(symbol).name();
+
+    // Resolve either a fixture function itself or an import or stub definition.
+    fixture_candidates_from_symbol_definitions(db, name, std::slice::from_ref(&definition))
+        .into_iter()
+        .filter(|target| fixture_declaration(db, *target).is_some())
+        .collect()
 }
 
 /// An eligible fixture parameter and the context needed to resolve its request.
@@ -666,6 +830,77 @@ enum FixtureName {
     /// Represents a public name that ty cannot determine statically, such as a
     /// dynamically-typed expression or a non-literal `str`.
     Unknown,
+}
+
+/// Returns whether the function containing `definition` remains available for fixture requests.
+fn is_available_fixture_request_parameter<'db>(
+    db: &'db dyn Db,
+    definition: Definition<'db>,
+) -> bool {
+    let file = definition.program_file(db);
+    let index = semantic_index(db, file);
+    let function_scope = definition.scope(db).file_scope_id(db);
+    let Some(function_ref) = index.scope(function_scope).node().as_function() else {
+        return false;
+    };
+    let Some(parent_scope) = non_type_parameter_parent(index, function_scope) else {
+        return false;
+    };
+    let mut search_scope_availability = FxHashMap::default();
+    if !is_available_fixture_search_scope(db, index, parent_scope, &mut search_scope_availability) {
+        return false;
+    }
+
+    is_available_definition_in_scope(
+        db,
+        index,
+        parent_scope,
+        index.expect_single_definition(function_ref),
+    )
+}
+
+/// Returns whether `scope` and each enclosing class remain available from their parent scopes.
+fn is_available_fixture_search_scope<'db>(
+    db: &'db dyn Db,
+    index: &ty_python_core::SemanticIndex<'db>,
+    scope: FileScopeId,
+    availability: &mut FxHashMap<FileScopeId, bool>,
+) -> bool {
+    if let Some(available) = availability.get(&scope) {
+        return *available;
+    }
+
+    let available = match index.scope(scope).kind() {
+        ScopeKind::Module => true,
+        ScopeKind::Class => non_type_parameter_parent(index, scope).is_some_and(|parent| {
+            if !is_available_fixture_search_scope(db, index, parent, availability) {
+                return false;
+            }
+
+            let class_ref = index.scope(scope).node().expect_class();
+            let definition = index.expect_single_definition(class_ref);
+            is_available_definition_in_scope(db, index, parent, definition)
+        }),
+        _ => false,
+    };
+    availability.insert(scope, available);
+    available
+}
+
+/// Returns whether `definition` remains bound in `scope` and exists at runtime.
+fn is_available_definition_in_scope<'db>(
+    db: &'db dyn Db,
+    index: &ty_python_core::SemanticIndex<'db>,
+    scope: FileScopeId,
+    definition: Definition<'db>,
+) -> bool {
+    let resolution = DefinitionResolution::from_bindings(
+        db,
+        index
+            .use_def_map(scope)
+            .end_of_scope_bindings(definition.place(db)),
+    );
+    resolution.definitions().contains(&definition) && exists_at_runtime(db, definition)
 }
 
 /// A class hierarchy or scope searched when resolving a fixture request.
@@ -1436,7 +1671,10 @@ mod tests {
     use ty_python_core::definition::Definition;
     use ty_python_core::semantic_index;
 
-    use super::{fixture_bindings_for_parameter, pytest_global_plugin_files};
+    use super::{
+        end_of_scope_definition, fixture_bindings_for_parameter, fixture_reference_candidates,
+        fixture_reference_identities, pytest_global_plugin_files,
+    };
     use crate::Db as _;
     use crate::db::tests::{TestDb, TestDbBuilder};
 
@@ -2353,9 +2591,12 @@ class TestExample(Base):
                     r#"
 import pytest
 
+@pytest.fixture
+def dependency(): ...
+
 class Plugin:
     @pytest.fixture
-    def resource(self): ...
+    def resource(self, dependency): ...
 "#,
                 ),
                 (
@@ -2371,6 +2612,9 @@ class TestExample(Plugin):
         );
 
         let test_use = test.function("TestExample.test_use");
+        let dependency = test.function_definition("/src/plugin.pyi", "dependency");
+        let resource_dependency =
+            parameter_definition(&test.db, "/src/plugin.pyi", "Plugin.resource", "dependency");
 
         assert_snapshot!(test_use.fixture_resolution("resource"), @"
         info[pytest-fixture]: Resolve fixture for parameter
@@ -2379,11 +2623,19 @@ class TestExample(Plugin):
         5 |     def test_use(self, resource): ...
           |                        ^^^^^^^^ fixture requested here
         info: Found 1 fixture
-         --> src/plugin.pyi:6:9
+         --> src/plugin.pyi:9:9
           |
-        6 |     def resource(self): ...
+        9 |     def resource(self, dependency): ...
           |         --------
         ");
+        assert_eq!(
+            test.fixture_reference_identities(resource_dependency),
+            [dependency]
+        );
+        assert!(
+            test.fixture_candidates("/src/plugin.pyi")
+                .contains(&resource_dependency)
+        );
     }
 
     #[test]
@@ -3100,6 +3352,289 @@ default_plugins = ("not-valid", "baseplugin")
         );
     }
 
+    #[test]
+    fn normalizes_fixture_declarations_exposures_and_requests_to_canonical_identities() {
+        let test = PytestTestCase::with_files(
+            "/src/test_example.py",
+            &[
+                (
+                    "/src/fixtures.py",
+                    r#"
+import pytest
+
+@pytest.fixture(name="public_name")
+def implementation(): ...
+"#,
+                ),
+                (
+                    "/src/fixtures.pyi",
+                    r#"
+def implementation() -> object: ...
+"#,
+                ),
+                (
+                    "/src/reexports.py",
+                    r#"
+from fixtures import implementation as middle
+"#,
+                ),
+                (
+                    "/src/test_example.py",
+                    r#"
+from reexports import middle
+
+def test_use(public_name):
+    print(public_name)
+"#,
+                ),
+            ],
+        );
+
+        let declaration = test.function_definition("/src/fixtures.py", "implementation");
+        let exposure = test.global_definition("/src/reexports.py", "middle");
+        let request =
+            parameter_definition(&test.db, "/src/test_example.py", "test_use", "public_name");
+
+        assert_eq!(
+            test.fixture_reference_identities(declaration),
+            [declaration]
+        );
+        assert_eq!(test.fixture_reference_identities(exposure), [declaration]);
+        assert_eq!(test.fixture_reference_identities(request), [declaration]);
+        assert!(
+            test.fixture_candidates("/src/fixtures.py")
+                .contains(&declaration)
+        );
+        assert!(
+            test.fixture_candidates("/src/reexports.py")
+                .contains(&exposure)
+        );
+        assert!(
+            test.fixture_candidates("/src/test_example.py")
+                .contains(&request)
+        );
+    }
+
+    #[test]
+    fn connects_nested_class_fixture_references() {
+        let test = PytestTestCase::new(
+            "/src/test_example.py",
+            r#"
+import pytest
+
+class TestOuter:
+    class TestInner:
+        @pytest.fixture
+        def resource(self): ...
+
+        def test_use(self, resource): ...
+"#,
+        );
+
+        let fixture =
+            test.function_definition("/src/test_example.py", "TestOuter.TestInner.resource");
+        let request = parameter_definition(
+            &test.db,
+            "/src/test_example.py",
+            "TestOuter.TestInner.test_use",
+            "resource",
+        );
+
+        assert_eq!(test.fixture_reference_identities(fixture), [fixture]);
+        assert_eq!(test.fixture_reference_identities(request), [fixture]);
+        assert!(
+            test.fixture_candidates("/src/test_example.py")
+                .contains(&fixture)
+        );
+        assert!(
+            test.fixture_candidates("/src/test_example.py")
+                .contains(&request)
+        );
+    }
+
+    #[test]
+    fn excludes_function_local_class_fixtures_from_reference_queries() {
+        let test = PytestTestCase::new(
+            "/src/test_example.py",
+            r#"
+import pytest
+
+def factory():
+    class TestLocal:
+        @pytest.fixture
+        def resource(self, dependency): ...
+"#,
+        );
+        let dependency = parameter_definition(
+            &test.db,
+            "/src/test_example.py",
+            "factory.TestLocal.resource",
+            "dependency",
+        );
+
+        assert!(test.fixture_candidates("/src/test_example.py").is_empty());
+        assert!(test.fixture_reference_identities(dependency).is_empty());
+    }
+
+    #[test]
+    fn excludes_overwritten_fixtures_from_reference_queries() {
+        let test = PytestTestCase::new(
+            "/src/test_example.py",
+            r#"
+import pytest
+
+@pytest.fixture
+def dependency(): ...
+
+@pytest.fixture
+def hidden(dependency): ...
+
+if True:
+    hidden = object()
+"#,
+        );
+        let dependency = test.function_definition("/src/test_example.py", "dependency");
+        let hidden_definition = test.function_definition("/src/test_example.py", "hidden");
+        let hidden_request =
+            parameter_definition(&test.db, "/src/test_example.py", "hidden", "dependency");
+        let candidates = test.fixture_candidates("/src/test_example.py");
+
+        assert!(candidates.contains(&dependency));
+        assert!(!candidates.contains(&hidden_definition));
+        assert!(!candidates.contains(&hidden_request));
+        assert!(
+            test.fixture_reference_identities(hidden_definition)
+                .is_empty()
+        );
+        assert!(test.fixture_reference_identities(hidden_request).is_empty());
+    }
+
+    #[test]
+    fn excludes_fixtures_in_overwritten_classes_from_reference_queries() {
+        let test = PytestTestCase::new(
+            "/src/test_example.py",
+            r#"
+import pytest
+
+class TestHidden:
+    @pytest.fixture
+    def resource(self, dependency): ...
+
+TestHidden = object()
+"#,
+        );
+        let resource = test.function_definition("/src/test_example.py", "TestHidden.resource");
+
+        assert!(test.fixture_candidates("/src/test_example.py").is_empty());
+        assert!(test.fixture_reference_identities(resource).is_empty());
+    }
+
+    #[test]
+    fn excludes_overwritten_test_functions_from_reference_candidates() {
+        let test = PytestTestCase::new(
+            "/src/test_example.py",
+            r#"
+def test_use(resource): ...
+
+test_use = None
+"#,
+        );
+        let resource =
+            parameter_definition(&test.db, "/src/test_example.py", "test_use", "resource");
+
+        assert!(
+            !test
+                .fixture_candidates("/src/test_example.py")
+                .contains(&resource)
+        );
+    }
+
+    #[test]
+    fn keeps_ambiguous_reference_targets_anchored() {
+        let test = PytestTestCase::with_files(
+            "/src/test_example.py",
+            &[
+                (
+                    "/src/first.py",
+                    r#"
+import pytest
+
+@pytest.fixture
+def first(): ...
+"#,
+                ),
+                (
+                    "/src/second.py",
+                    r#"
+import pytest
+
+@pytest.fixture
+def second(): ...
+"#,
+                ),
+                (
+                    "/src/test_example.py",
+                    r#"
+flag: bool
+
+if flag:
+    from first import first as resource
+else:
+    from second import second as resource
+
+def test_use(resource): ...
+"#,
+                ),
+            ],
+        );
+
+        let first = test.function_definition("/src/first.py", "first");
+        let second = test.function_definition("/src/second.py", "second");
+        let request =
+            parameter_definition(&test.db, "/src/test_example.py", "test_use", "resource");
+        let mut request_targets = test.fixture_reference_identities(request);
+        test.sort_definitions_by_name(&mut request_targets);
+
+        assert_eq!(request_targets, [first, second]);
+        assert_eq!(test.fixture_reference_identities(first), [first]);
+        assert_eq!(test.fixture_reference_identities(second), [second]);
+    }
+
+    #[test]
+    fn includes_candidate_parameters_only_for_fixture_and_test_functions() {
+        let test = PytestTestCase::new(
+            "/src/test_example.py",
+            r#"
+import pytest
+from typing import TYPE_CHECKING
+
+@pytest.fixture
+def resource(dependency): ...
+
+def test_use(request): ...
+
+def helper(ordinary): ...
+
+if TYPE_CHECKING:
+    def test_hidden(hidden): ...
+"#,
+        );
+        let dependency =
+            parameter_definition(&test.db, "/src/test_example.py", "resource", "dependency");
+        let request = parameter_definition(&test.db, "/src/test_example.py", "test_use", "request");
+        let ordinary = parameter_definition(&test.db, "/src/test_example.py", "helper", "ordinary");
+        let candidates = test.fixture_candidates("/src/test_example.py");
+
+        assert!(candidates.contains(&dependency));
+        assert!(candidates.contains(&request));
+        assert!(!candidates.contains(&ordinary));
+        assert!(
+            !candidates
+                .iter()
+                .any(|candidate| candidate.name(&test.db).as_deref() == Some("hidden"))
+        );
+    }
+
     struct PytestTestCase {
         db: TestDb,
         path: &'static str,
@@ -3168,6 +3703,29 @@ default_plugins = ("not-valid", "baseplugin")
                 })
                 .collect()
         }
+
+        fn function_definition<'db>(&'db self, path: &str, name: &str) -> Definition<'db> {
+            function_definition(&self.db, path, name)
+        }
+
+        fn global_definition<'db>(&'db self, path: &str, name: &str) -> Definition<'db> {
+            global_definition(&self.db, path, name)
+        }
+
+        fn fixture_reference_identities<'db>(
+            &'db self,
+            definition: Definition<'db>,
+        ) -> Vec<Definition<'db>> {
+            fixture_reference_identities(&self.db, definition).to_vec()
+        }
+
+        fn fixture_candidates<'db>(&'db self, path: &str) -> Vec<Definition<'db>> {
+            fixture_candidates(&self.db, path)
+        }
+
+        fn sort_definitions_by_name<'db>(&'db self, definitions: &mut [Definition<'db>]) {
+            definitions.sort_by_key(|definition| definition.name(&self.db));
+        }
     }
 
     struct PytestTestFunction<'test> {
@@ -3178,7 +3736,7 @@ default_plugins = ("not-valid", "baseplugin")
     impl PytestTestFunction<'_> {
         fn fixture_resolution(&self, parameter_name: &str) -> String {
             let db = &self.test.db;
-            let parameter = self.parameter_definition(parameter_name);
+            let parameter = parameter_definition(db, self.test.path, &self.name, parameter_name);
             let fixtures = fixture_bindings_for_parameter(db, parameter);
             if fixtures.is_empty() {
                 return format!("No fixture resolved for parameter `{parameter_name}`");
@@ -3220,26 +3778,47 @@ default_plugins = ("not-valid", "baseplugin")
             .to_string()
             .replace('\\', "/")
         }
+    }
 
-        fn parameter_definition<'db>(&'db self, parameter_name: &str) -> Definition<'db> {
-            let db = &self.test.db;
-            let file = system_path_to_file(db, self.test.path).expect("test file exists");
-            let file = db.program_file(file);
-            let module = parsed_module(db, file.python_file(db)).load(db);
-            let function = find_function(module.suite(), &self.name).expect("test function exists");
-            let index = semantic_index(db, file);
-            let parameter = function
-                .parameters
-                .iter()
-                .find(|candidate| candidate.name().as_str() == parameter_name)
-                .expect("test parameter exists");
-            match parameter {
-                ast::AnyParameterRef::Variadic(parameter) => {
-                    index.expect_single_definition(parameter)
-                }
-                ast::AnyParameterRef::NonVariadic(parameter) => {
-                    index.expect_single_definition(parameter)
-                }
+    fn function_definition<'db>(db: &'db TestDb, path: &str, function: &str) -> Definition<'db> {
+        let file = system_path_to_file(db, path).expect("test file exists");
+        let file = db.program_file(file);
+        let module = parsed_module(db, file.python_file(db)).load(db);
+        let function = find_function(module.suite(), function).expect("function exists");
+        semantic_index(db, file).expect_single_definition(function)
+    }
+
+    fn global_definition<'db>(db: &'db TestDb, path: &str, name: &str) -> Definition<'db> {
+        let file = system_path_to_file(db, path).expect("test file exists");
+        let file = db.program_file(file);
+        end_of_scope_definition(db, file, name).expect("global definition exists")
+    }
+
+    fn fixture_candidates<'db>(db: &'db TestDb, path: &str) -> Vec<Definition<'db>> {
+        let file = system_path_to_file(db, path).expect("test file exists");
+        fixture_reference_candidates(db, db.program_file(file)).to_vec()
+    }
+
+    fn parameter_definition<'db>(
+        db: &'db TestDb,
+        path: &str,
+        function: &str,
+        parameter_name: &str,
+    ) -> Definition<'db> {
+        let file = system_path_to_file(db, path).expect("test file exists");
+        let file = db.program_file(file);
+        let module = parsed_module(db, file.python_file(db)).load(db);
+        let function = find_function(module.suite(), function).expect("test function exists");
+        let index = semantic_index(db, file);
+        let parameter = function
+            .parameters
+            .iter()
+            .find(|candidate| candidate.name().as_str() == parameter_name)
+            .expect("test parameter exists");
+        match parameter {
+            ast::AnyParameterRef::Variadic(parameter) => index.expect_single_definition(parameter),
+            ast::AnyParameterRef::NonVariadic(parameter) => {
+                index.expect_single_definition(parameter)
             }
         }
     }
@@ -3248,12 +3827,19 @@ default_plugins = ("not-valid", "baseplugin")
         statements: &'ast [ast::Stmt],
         selector: &str,
     ) -> Option<&'ast ast::StmtFunctionDef> {
-        if let Some((class_name, nested)) = selector.split_once('.') {
+        if let Some((scope_name, nested)) = selector.split_once('.') {
             return statements.iter().find_map(|statement| {
-                let class = statement.as_class_def_stmt()?;
-                (class.name.as_str() == class_name)
-                    .then(|| find_function(&class.body, nested))
-                    .flatten()
+                if let Some(class) = statement.as_class_def_stmt()
+                    && class.name.as_str() == scope_name
+                {
+                    return find_function(&class.body, nested);
+                }
+                if let Some(function) = statement.as_function_def_stmt()
+                    && function.name.as_str() == scope_name
+                {
+                    return find_function(&function.body, nested);
+                }
+                None
             });
         }
 
