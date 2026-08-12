@@ -10,10 +10,12 @@
 //! all references to these externally-visible symbols therefore requires
 //! an expensive search of all source files in the workspace.
 
+use std::collections::hash_map::Entry;
+
 use crate::goto::{Definitions, GotoTarget};
-use crate::{Db, ReferenceKind, ReferenceTarget};
+use crate::{Db, FxIndexSet, ReferenceKind, ReferenceTarget};
 use rayon::prelude::*;
-use ruff_db::parsed::parsed_module;
+use ruff_db::parsed::{ParsedModuleRef, parsed_module};
 use ruff_python_ast::find_node::{CoveringNode, covering_node};
 use ruff_python_ast::token::Tokens;
 use ruff_python_ast::{
@@ -21,12 +23,16 @@ use ruff_python_ast::{
     visitor::source_order::{SourceOrderVisitor, TraversalSignal},
 };
 use ruff_text_size::Ranged;
+use rustc_hash::{FxHashMap, FxHashSet};
+use ty_module_resolver::{ImportingFile, file_to_module, resolve_module};
 use ty_project::parallel::{ParallelIteratorExt, minimum_parallel_job_len};
-use ty_python_core::ProgramFile;
 use ty_python_core::definition::{Definition, DefinitionKind, DefinitionState};
 use ty_python_core::scope::{FileScopeId, NodeWithScopeKind, ScopeKind};
+use ty_python_core::{ProgramFile, place_table};
 use ty_python_semantic::{
     ImportAliasResolution, ResolvedDefinition, SemanticModel, contains_identifier,
+    definitions_for_imported_symbol, fixture_reference_candidates, fixture_reference_identities,
+    fixture_reference_search_files,
 };
 
 /// Salsa snapshots coordinate clone and drop through shared state. For cached files that don't
@@ -93,16 +99,33 @@ pub(crate) fn references(
 ) -> Option<Vec<ReferenceTarget>> {
     let source_file = file.file(db);
     let model = SemanticModel::new(db, file);
-    let target_definitions = goto_target.definitions(&model, mode.to_import_alias_resolution())?;
+    let mut target_definitions =
+        goto_target.definitions(&model, mode.to_import_alias_resolution())?;
+    let mut fixture_references = Vec::new();
+
+    if matches!(
+        mode,
+        ReferencesMode::References | ReferencesMode::ReferencesSkipDeclaration
+    ) && goto_target_has_fixture_identities(db, &model, goto_target)
+    {
+        let (fixture_identities, ordinary_definitions) =
+            partition_by_fixture_identity(db, &target_definitions);
+
+        if !fixture_identities.is_empty() {
+            if ordinary_definitions.is_empty() {
+                let fixture_references =
+                    pytest_fixture_references(db, file, &fixture_identities, mode);
+                return (!fixture_references.is_empty()).then_some(fixture_references);
+            }
+
+            target_definitions = Definitions::new(ordinary_definitions);
+            fixture_references = pytest_fixture_references(db, file, &fixture_identities, mode);
+        }
+    }
+
     let is_externally_visible_symbol =
         has_any_external_visible_definitions(db, &target_definitions);
     let target_definitions = target_definitions.goto_declaration(&model, goto_target)?;
-
-    // Extract the target text from the goto target for fast comparison
-    let target_text = goto_target.to_string()?;
-
-    // Find all of the references to the symbol within this file
-    let mut references = references_for_file(db, file, &target_definitions, &target_text, mode);
 
     // Check if we should search across files based on the mode
     let search_across_files = matches!(
@@ -116,6 +139,15 @@ pub(crate) fn references(
     // argument labels (e.g. `f(param=...)`). Handle this case with a narrow scan that only
     // considers keyword arguments.
     let is_parameter = parameter_owner_is_externally_visible(db, &target_definitions);
+
+    let searches = LocalReferenceSearches::single(
+        goto_target.to_string()?.into_owned(),
+        target_definitions,
+        mode.to_import_alias_resolution(),
+    );
+
+    // Find all of the references to the symbol within this file.
+    let mut references = references_for_file(db, file, &searches, mode);
 
     if search_across_files && (is_parameter || is_externally_visible_symbol) {
         let program = model.program();
@@ -131,28 +163,28 @@ pub(crate) fn references(
             .with_min_len(minimum_job_len)
             .map_with_db(db, |db, other_file| {
                 let source = ruff_db::source::source_text(db, other_file);
-                if !contains_identifier(&source, &target_text) {
+                if !searches.may_match_source(&source) {
                     return Vec::new();
                 }
 
                 let other_file = ProgramFile::new(db, other_file, program);
 
                 if is_externally_visible_symbol {
-                    references_for_file(db, other_file, &target_definitions, &target_text, mode)
+                    references_for_file(db, other_file, &searches, mode)
                 } else {
-                    references_for_keyword_arguments_in_file(
-                        db,
-                        other_file,
-                        &target_definitions,
-                        &target_text,
-                        mode,
-                    )
+                    references_for_keyword_arguments_in_file(db, other_file, &searches, mode)
                 }
             })
             .flat_map_iter(|references| references)
             .collect::<Vec<_>>();
 
         references.extend(other_references);
+    }
+
+    if !fixture_references.is_empty() {
+        references.extend(fixture_references);
+        let mut seen_ranges = FxHashSet::default();
+        references.retain(|reference| seen_ranges.insert(reference.file_range()));
     }
 
     if references.is_empty() {
@@ -162,11 +194,504 @@ pub(crate) fn references(
     }
 }
 
+/// Whether or not the goto target is related to pytest fixture declaration.
+///
+/// This is true when a parameter (implicitly) requests a pytest fixture, when
+/// a function itself defines a fixture, or when an import or stub definition
+/// references a fixture.
+fn goto_target_has_fixture_identities(
+    db: &dyn Db,
+    model: &SemanticModel<'_>,
+    goto_target: &GotoTarget<'_>,
+) -> bool {
+    goto_target
+        .definitions(model, ImportAliasResolution::PreserveAliases)
+        .is_some_and(|definitions| {
+            definitions.iter().any(|resolved| {
+                resolved.definition().is_some_and(|definition| {
+                    !fixture_reference_identities(db, definition).is_empty()
+                })
+            })
+        })
+}
+
+/// Split the given list of definitions into two lists:
+///
+/// 1. All the resolved pytest fixture identities from the definitions in the original list
+/// 2. All of the ordinary (i.e., non-fixture-related) definitions from the original list.
+fn partition_by_fixture_identity<'db>(
+    db: &'db dyn Db,
+    definitions: &Definitions<'db>,
+) -> (Vec<Definition<'db>>, Vec<ResolvedDefinition<'db>>) {
+    let mut seen = FxHashSet::default();
+    let mut fixture_identities = Vec::new();
+    let mut ordinary_definitions = Vec::new();
+
+    for resolved in definitions {
+        let Some(definition) = resolved.definition() else {
+            ordinary_definitions.push(resolved.clone());
+            continue;
+        };
+
+        let identities = fixture_reference_identities(db, definition);
+
+        if identities.is_empty() {
+            ordinary_definitions.push(resolved.clone());
+        } else {
+            fixture_identities.extend(
+                identities
+                    .iter()
+                    .copied()
+                    .filter(|target| seen.insert(*target)),
+            );
+        }
+    }
+
+    (fixture_identities, ordinary_definitions)
+}
+
+/// Finds all references related to any of the given pytest fixture identities.
+fn pytest_fixture_references(
+    db: &dyn Db,
+    source_file: ProgramFile<'_>,
+    fixture_identities: &[Definition<'_>],
+    mode: ReferencesMode,
+) -> Vec<ReferenceTarget> {
+    let program = source_file.program(db);
+
+    // Search the source file, all project files, the files that define the fixtures (and their
+    // stubs), and installed plugin files. A file can belong to more than one group, so deduplicate
+    // the combined list before scanning it.
+    let files: FxIndexSet<_> = std::iter::once(source_file.file(db))
+        .chain(db.project().files(db).iter().copied())
+        .chain(fixture_identities.iter().flat_map(|definition| {
+            let target_file = definition.program_file(db);
+            std::iter::once(target_file.file(db)).chain(
+                fixture_identity_stub_file(db, *definition).map(|stub_file| stub_file.file(db)),
+            )
+        }))
+        .chain(
+            fixture_reference_search_files(db, program)
+                .iter()
+                .map(|file| file.file(db)),
+        )
+        .collect();
+    let files: Vec<_> = files
+        .into_iter()
+        .map(|file| ProgramFile::new(db, file, program))
+        .collect();
+
+    let fixture_identities = fixture_identities.to_vec();
+
+    // Use the same batched Salsa-snapshot strategy as ordinary cross-file search.
+    let minimum_job_len = minimum_parallel_job_len(files.len(), MAX_MIN_FILES_PER_PARALLEL_JOB);
+    let references = files
+        .into_par_iter()
+        .with_min_len(minimum_job_len)
+        .map_with_db(db, |db, file| {
+            pytest_fixture_references_for_file(db, file, &fixture_identities, mode)
+        })
+        .flat_map_iter(|references| references)
+        .collect::<Vec<_>>();
+
+    let mut seen_ranges = FxHashSet::default();
+    references
+        .into_iter()
+        .filter(|reference| seen_ranges.insert(reference.file_range()))
+        .collect()
+}
+
+/// Finds references in `file` related to any of the given fixture identities.
+fn pytest_fixture_references_for_file<'db>(
+    db: &'db dyn Db,
+    file: ProgramFile<'db>,
+    fixture_identities: &[Definition<'db>],
+    mode: ReferencesMode,
+) -> Vec<ReferenceTarget> {
+    let source = ruff_db::source::source_text(db, file.file(db));
+    let candidates = fixture_reference_candidates(db, file);
+    let parsed = parsed_module(db, file.python_file(db));
+    let module = parsed.load(db);
+    let model = SemanticModel::new(db, file);
+
+    // Represent every matching fixture declaration, exposure, and request as an ordinary
+    // name-based reference search. This preserves each binding's local name and alias behavior
+    // while reusing the existing semantic reference walker.
+    let mut searches = LocalReferenceSearches::default();
+
+    for fixture_identity in fixture_identities {
+        let Some(name) = fixture_identity.name(db) else {
+            continue;
+        };
+        searches.insert(
+            name,
+            ResolvedDefinition::Definition(*fixture_identity),
+            mode.to_import_alias_resolution(),
+        );
+    }
+
+    // An ambiguous fixture request can connect multiple fixture identities:
+    //
+    // ```py
+    // if flag:
+    //     from first import first as resource
+    // else:
+    //     from second import second as resource
+    //
+    // def test_use(resource): ...
+    // ```
+    //
+    // A search starting from `first` should include the request and its uses because the request
+    // may resolve to `first`, but it should not include the `second as resource` declaration.
+    //
+    // Record non-matching fixture candidates so that we can provide that behaviour.
+    let mut non_matching_fixture_candidate_ranges = Vec::new();
+
+    for &candidate in candidates {
+        let candidate_fixture_identities = fixture_reference_identities(db, candidate);
+        let shares_fixture_identity = candidate_fixture_identities
+            .iter()
+            .any(|fixture_identity| fixture_identities.contains(fixture_identity));
+
+        if !shares_fixture_identity {
+            if !candidate_fixture_identities.is_empty() {
+                non_matching_fixture_candidate_ranges
+                    .push(candidate.focus_range(db, &module).range());
+            }
+            continue;
+        }
+
+        if let DefinitionKind::ImportFrom(import) = candidate.kind(db) {
+            let import_node = import.import(&module);
+            let alias = import.alias(&module);
+
+            // An imported name can resolve to a stub or a renamed re-export instead of the runtime
+            // fixture definition. For example:
+            //
+            // ```python
+            // # reexports.py
+            // from fixtures import resource as middle
+            //
+            // # test_example.py
+            // from reexports import middle
+            // ```
+            //
+            // While scanning `test_example.py`, add a search for the name `middle` that targets
+            // the `middle` import definition in `reexports.py`. Each file adds such searches for
+            // its own imports, so intermediate definitions are not searched in unrelated files.
+            for resolved in definitions_for_imported_symbol(
+                &model,
+                import_node,
+                alias.name.as_str(),
+                ImportAliasResolution::PreserveAliases,
+            ) {
+                let Some(definition) = resolved.definition() else {
+                    continue;
+                };
+                if fixture_identities.contains(&definition)
+                    || !fixture_reference_identities(db, definition)
+                        .iter()
+                        .any(|identity| fixture_identities.contains(identity))
+                {
+                    continue;
+                }
+                searches.insert(
+                    alias.name.to_string(),
+                    ResolvedDefinition::Definition(definition),
+                    ImportAliasResolution::PreserveAliases,
+                );
+            }
+        }
+
+        let is_parameter = matches!(candidate.kind(db), DefinitionKind::Parameter(_));
+        let import_alias_resolution = if is_parameter {
+            mode.to_import_alias_resolution()
+        } else {
+            // An exposure participates through its local binding. Resolving its alias here could
+            // include a definition for a different fixture identity when the binding is ambiguous.
+            ImportAliasResolution::PreserveAliases
+        };
+        let Some(symbol) = candidate.place(db).as_symbol() else {
+            continue;
+        };
+        let name = place_table(db, candidate.scope(db))
+            .symbol(symbol)
+            .name()
+            .to_string();
+
+        searches.insert(
+            name,
+            ResolvedDefinition::Definition(candidate),
+            import_alias_resolution,
+        );
+    }
+
+    let mut references = if searches.may_match_source(&source) {
+        references_for_parsed_file(&model, &module, &searches, mode)
+    } else {
+        Vec::new()
+    };
+
+    references.retain(|reference| {
+        !non_matching_fixture_candidate_ranges
+            .iter()
+            .any(|range| range.contains_range(reference.range()))
+    });
+
+    references
+}
+
+/// Semantic searches to perform during a single traversal of a file.
+///
+/// An ordinary reference search usually has one name:
+///
+/// ```python
+/// resource = 1
+/// print(resource)
+/// ```
+///
+/// A pytest fixture reference search can have several names for the same fixture family:
+///
+/// ```python
+/// from fixtures import resource as alias
+///
+/// def test_use(alias): ...
+/// ```
+///
+/// This fixture search contains both `resource`, for the imported name, and
+/// `alias`, for the local binding and fixture request.
+///
+/// Storing single-name and multi-name searches separately lets the common
+/// single-name case use a direct string comparison. Searches for several names
+/// use a hash lookup so they can share one syntax-tree walk.
+#[derive(Default)]
+enum LocalReferenceSearches<'db> {
+    /// No names have been added yet.
+    #[default]
+    Empty,
+    /// Exactly one identifier name is part of the search.
+    Single {
+        /// The identifier text to look for in the syntax tree.
+        name: String,
+        /// The semantic definitions and alias-resolution behavior associated with `name`.
+        targets: ReferenceTargets<'db>,
+    },
+    /// Two or more identifier names are part of the search.
+    Multiple {
+        /// Maps each identifier text to its semantic definitions and alias-resolution behavior.
+        by_name: FxHashMap<String, ReferenceTargets<'db>>,
+    },
+}
+
+impl<'db> LocalReferenceSearches<'db> {
+    /// Creates the common single-name search without allocating a hash table.
+    fn single(
+        name: String,
+        definitions: Definitions<'db>,
+        import_alias_resolution: ImportAliasResolution,
+    ) -> Self {
+        Self::Single {
+            name,
+            targets: ReferenceTargets::new(definitions, import_alias_resolution),
+        }
+    }
+
+    /// Adds one semantic definition under `name` and the given alias-resolution behavior.
+    fn insert(
+        &mut self,
+        name: String,
+        definition: ResolvedDefinition<'db>,
+        import_alias_resolution: ImportAliasResolution,
+    ) {
+        // Take ownership of the current state so that a second distinct name
+        // can promote `Single` to `Multiple` without cloning either the first
+        // name or its definitions.
+        let current = std::mem::take(self);
+
+        *self = match current {
+            Self::Empty => Self::Single {
+                name,
+                targets: ReferenceTargets::from_definition(definition, import_alias_resolution),
+            },
+            Self::Single {
+                name: existing_name,
+                mut targets,
+            } if existing_name == name => {
+                // One name can need both alias-resolution behaviors (see the
+                // comment on `ReferenceTargets`), so merge by behavior rather
+                // than creating another name entry.
+                targets.insert(definition, import_alias_resolution);
+                Self::Single {
+                    name: existing_name,
+                    targets,
+                }
+            }
+            Self::Single {
+                name: existing_name,
+                targets: existing_targets,
+            } => {
+                // Adding a second identifier name switches subsequent lookups to the hash table.
+                let mut by_name = FxHashMap::default();
+                by_name.insert(existing_name, existing_targets);
+                by_name.insert(
+                    name,
+                    ReferenceTargets::from_definition(definition, import_alias_resolution),
+                );
+                Self::Multiple { by_name }
+            }
+            Self::Multiple { mut by_name } => {
+                match by_name.entry(name) {
+                    Entry::Occupied(mut entry) => {
+                        entry.get_mut().insert(definition, import_alias_resolution);
+                    }
+                    Entry::Vacant(entry) => {
+                        entry.insert(ReferenceTargets::from_definition(
+                            definition,
+                            import_alias_resolution,
+                        ));
+                    }
+                }
+                Self::Multiple { by_name }
+            }
+        };
+    }
+
+    /// Returns the semantic targets associated with the exact identifier text `name`.
+    fn for_name(&self, name: &str) -> Option<&ReferenceTargets<'db>> {
+        match self {
+            Self::Empty => None,
+            Self::Single {
+                name: target_name,
+                targets,
+            } => (target_name == name).then_some(targets),
+            Self::Multiple { by_name } => by_name.get(name),
+        }
+    }
+
+    /// Returns whether `source` contains at least one identifier name in this search.
+    fn may_match_source(&self, source: &str) -> bool {
+        match self {
+            Self::Empty => false,
+            Self::Single { name, .. } => contains_identifier(source, name),
+            Self::Multiple { by_name } => {
+                by_name.keys().any(|name| contains_identifier(source, name))
+            }
+        }
+    }
+}
+
+/// Semantic targets for one identifier name, separated by import-alias behavior.
+///
+/// The same name can need both behaviors:
+///
+/// ```python
+/// # reexports.py
+/// from fixtures import resource as middle
+///
+/// # test_example.py
+/// from reexports import middle
+///
+/// def test_use(middle): ...
+/// ```
+///
+/// In `test_example.py`, the imported `middle` must match the `middle` definition
+/// exposed by `reexports.py`. The fixture parameter also has the name `middle`,
+/// but it must resolve through that import to the original `resource` fixture.
+struct ReferenceTargets<'db> {
+    /// Definitions matched after following import aliases, such as the fixture
+    /// requested by the `middle` parameter above.
+    resolve_aliases: Option<Definitions<'db>>,
+    /// Definitions matched while keeping import bindings distinct, such as the
+    /// `middle` imported from `reexports.py` above.
+    preserve_aliases: Option<Definitions<'db>>,
+}
+
+impl<'db> ReferenceTargets<'db> {
+    /// Creates targets for one alias-resolution behavior from an existing definition set.
+    fn new(definitions: Definitions<'db>, import_alias_resolution: ImportAliasResolution) -> Self {
+        match import_alias_resolution {
+            ImportAliasResolution::ResolveAliases => Self {
+                resolve_aliases: Some(definitions),
+                preserve_aliases: None,
+            },
+            ImportAliasResolution::PreserveAliases => Self {
+                resolve_aliases: None,
+                preserve_aliases: Some(definitions),
+            },
+        }
+    }
+
+    /// Creates targets for one alias-resolution behavior from a single definition.
+    fn from_definition(
+        definition: ResolvedDefinition<'db>,
+        import_alias_resolution: ImportAliasResolution,
+    ) -> Self {
+        Self::new(Definitions::new(vec![definition]), import_alias_resolution)
+    }
+
+    /// Adds a definition to the set for the given alias-resolution behavior.
+    fn insert(
+        &mut self,
+        definition: ResolvedDefinition<'db>,
+        import_alias_resolution: ImportAliasResolution,
+    ) {
+        // Definitions using the same behavior can share one intersection check at each matching
+        // identifier. The other slot remains available if the same name also needs that behavior.
+        let definitions = match import_alias_resolution {
+            ImportAliasResolution::ResolveAliases => &mut self.resolve_aliases,
+            ImportAliasResolution::PreserveAliases => &mut self.preserve_aliases,
+        };
+        if let Some(definitions) = definitions {
+            definitions.insert(definition);
+        } else {
+            *definitions = Some(Definitions::new(vec![definition]));
+        }
+    }
+
+    /// Iterates over each populated alias-resolution behavior and its definitions.
+    fn iter(&self) -> impl Iterator<Item = (ImportAliasResolution, &Definitions<'db>)> + '_ {
+        [
+            self.resolve_aliases
+                .as_ref()
+                .map(|definitions| (ImportAliasResolution::ResolveAliases, definitions)),
+            self.preserve_aliases
+                .as_ref()
+                .map(|definitions| (ImportAliasResolution::PreserveAliases, definitions)),
+        ]
+        .into_iter()
+        .flatten()
+    }
+
+    /// Iterates over all semantic definitions, regardless of alias-resolution behavior.
+    fn definitions(&self) -> impl Iterator<Item = &ResolvedDefinition<'db>> + '_ {
+        self.iter().flat_map(|(_, definitions)| definitions.iter())
+    }
+}
+
+/// Returns the stub file through which a fixture identity may be exposed.
+fn fixture_identity_stub_file<'db>(
+    db: &'db dyn Db,
+    target: Definition<'db>,
+) -> Option<ProgramFile<'db>> {
+    let target_file = target.program_file(db);
+    let resolver_file = target_file.resolver_file(db);
+    let target_module = file_to_module(db, resolver_file)?;
+    let stub_module = resolve_module(
+        db,
+        ImportingFile::ResolverFile(resolver_file),
+        target_module.name(db),
+    )?;
+    let stub_file = stub_module.file(db)?;
+
+    stub_file
+        .is_stub(db)
+        .then(|| ProgramFile::new(db, stub_file, target_file.program(db)))
+}
+
 fn references_for_keyword_arguments_in_file(
     db: &dyn Db,
     file: ProgramFile<'_>,
-    target_definitions: &Definitions<'_>,
-    target_text: &str,
+    searches: &LocalReferenceSearches<'_>,
     mode: ReferencesMode,
 ) -> Vec<ReferenceTarget> {
     // This path is used for cross-file parameter keyword-label references.
@@ -184,10 +709,9 @@ fn references_for_keyword_arguments_in_file(
     let mut finder = KeywordArgumentReferencesFinder(LocalReferencesFinder {
         model: &model,
         tokens: module.tokens(),
-        target_definitions,
+        searches,
         references: &mut references,
         mode,
-        target_text,
         ancestors: Vec::new(),
     });
 
@@ -226,22 +750,30 @@ fn is_slots_assignment(node: AnyNodeRef<'_>, value: AnyNodeRef<'_>) -> bool {
 fn references_for_file(
     db: &dyn Db,
     file: ProgramFile<'_>,
-    target_definitions: &Definitions<'_>,
-    target_text: &str,
+    searches: &LocalReferenceSearches<'_>,
     mode: ReferencesMode,
 ) -> Vec<ReferenceTarget> {
     let parsed = parsed_module(db, file.python_file(db));
     let module = parsed.load(db);
     let model = SemanticModel::new(db, file);
+
+    references_for_parsed_file(&model, &module, searches, mode)
+}
+
+fn references_for_parsed_file<'a>(
+    model: &'a SemanticModel<'a>,
+    module: &'a ParsedModuleRef,
+    searches: &'a LocalReferenceSearches<'a>,
+    mode: ReferencesMode,
+) -> Vec<ReferenceTarget> {
     let mut references = Vec::new();
 
     let mut finder = LocalReferencesFinder {
-        model: &model,
-        target_definitions,
+        model,
+        searches,
         references: &mut references,
         mode,
         tokens: module.tokens(),
-        target_text,
         ancestors: Vec::new(),
     };
 
@@ -372,14 +904,13 @@ impl From<ast::ExprContext> for OccurrenceKind {
     }
 }
 
-/// AST visitor to find all references to a specific symbol by comparing semantic definitions
+/// AST visitor that finds references by comparing each matching name's semantic definitions.
 struct LocalReferencesFinder<'a> {
     model: &'a SemanticModel<'a>,
     tokens: &'a Tokens,
-    target_definitions: &'a Definitions<'a>,
+    searches: &'a LocalReferenceSearches<'a>,
     references: &'a mut Vec<ReferenceTarget>,
     mode: ReferencesMode,
-    target_text: &'a str,
     ancestors: Vec<AnyNodeRef<'a>>,
 }
 
@@ -389,14 +920,14 @@ impl<'a> SourceOrderVisitor<'a> for LocalReferencesFinder<'a> {
 
         match node {
             AnyNodeRef::ExprName(name_expr) => {
-                // If the name doesn't match our target text, this isn't a match
-                if name_expr.id.as_str() != self.target_text {
+                let target_text = name_expr.id.as_str();
+                if self.searches.for_name(target_text).is_none() {
                     return TraversalSignal::Traverse;
                 }
 
                 let kind = OccurrenceKind::from(name_expr.ctx);
                 let covering_node = CoveringNode::from_ancestors(self.ancestors.clone());
-                self.check_covering_node(&covering_node, kind);
+                self.check_covering_node(&covering_node, kind, target_text);
             }
             AnyNodeRef::ExprAttribute(attr_expr) => {
                 let kind = OccurrenceKind::from(attr_expr.ctx);
@@ -466,11 +997,10 @@ impl<'a> SourceOrderVisitor<'a> for LocalReferencesFinder<'a> {
                 {
                     let mut sub_finder = LocalReferencesFinder {
                         model: &sub_model,
-                        target_definitions: self.target_definitions,
+                        searches: self.searches,
                         references: self.references,
                         mode: self.mode,
                         tokens: sub_ast.tokens(),
-                        target_text: self.target_text,
                         ancestors: Vec::new(),
                     };
                     sub_finder.visit_expr(sub_ast.expr());
@@ -481,11 +1011,8 @@ impl<'a> SourceOrderVisitor<'a> for LocalReferencesFinder<'a> {
                 if let Some(asname) = &alias.asname {
                     self.check_declaration_identifier(asname);
                 }
-                // Only check the original name if it matches our target text
-                // This is for cases where we're renaming the imported symbol name itself
-                if alias.name.id == self.target_text {
-                    self.check_declaration_identifier(&alias.name);
-                }
+                // Also check the original name for renames of the imported symbol itself.
+                self.check_declaration_identifier(&alias.name);
             }
             _ => {}
         }
@@ -538,43 +1065,49 @@ impl<'a> LocalReferencesFinder<'a> {
     }
 
     fn check_identifier(&mut self, identifier: &ast::Identifier, kind: OccurrenceKind) {
-        // Quick text-based check first
-        if identifier.id != self.target_text {
+        let target_text = identifier.id.as_str();
+        if self.searches.for_name(target_text).is_none() {
             return;
         }
 
         let mut ancestors_with_identifier = self.ancestors.clone();
         ancestors_with_identifier.push(AnyNodeRef::from(identifier));
         let covering_node = CoveringNode::from_ancestors(ancestors_with_identifier);
-        self.check_covering_node(&covering_node, kind);
+        self.check_covering_node(&covering_node, kind, target_text);
     }
 
-    /// Returns the covering node's resolved definitions.
-    fn definitions_for_covering_node(
-        &self,
+    fn check_covering_node(
+        &mut self,
         covering_node: &CoveringNode<'_>,
-    ) -> Option<Definitions<'a>> {
+        kind: OccurrenceKind,
+        target_text: &str,
+    ) {
+        let Some(targets) = self.searches.for_name(target_text) else {
+            return;
+        };
+
         // Use the start of the covering node as the offset. Any offset within
         // the node is fine here. Offsets matter only for import statements
         // where the identifier might be a multi-part module name.
         let offset = covering_node.node().start();
-        let goto_target =
-            GotoTarget::from_covering_node(self.model, covering_node, offset, self.tokens)?;
-
-        let definitions = goto_target
-            .definitions(self.model, self.mode.to_import_alias_resolution())?
-            .goto_declaration(self.model, &goto_target)?;
-
-        Some(definitions)
-    }
-
-    fn check_covering_node(&mut self, covering_node: &CoveringNode<'_>, kind: OccurrenceKind) {
-        let Some(current_definitions) = self.definitions_for_covering_node(covering_node) else {
+        let Some(goto_target) =
+            GotoTarget::from_covering_node(self.model, covering_node, offset, self.tokens)
+        else {
             return;
         };
 
-        // Check if any of the current definitions match our target definitions
-        if !self.target_definitions.intersects(&current_definitions) {
+        // One identifier name can participate in searches with both alias-resolution behaviors.
+        // Resolve the occurrence once for each populated behavior and accept it if either
+        // definition set intersects the corresponding targets.
+        let matches = targets
+            .iter()
+            .any(|(import_alias_resolution, definitions)| {
+                goto_target
+                    .definitions(self.model, import_alias_resolution)
+                    .and_then(|definitions| definitions.goto_declaration(self.model, &goto_target))
+                    .is_some_and(|resolved| definitions.intersects(&resolved))
+            });
+        if !matches {
             return;
         }
 
@@ -616,7 +1149,8 @@ impl<'a> LocalReferencesFinder<'a> {
         let [part] = string_expr.value.as_slice() else {
             return;
         };
-        if part.value.as_ref() != self.target_text {
+        let target_text = part.value.as_ref();
+        if self.searches.for_name(target_text).is_none() {
             return;
         }
 
@@ -628,7 +1162,7 @@ impl<'a> LocalReferencesFinder<'a> {
         };
 
         // Only rename the slot if the target attribute belongs to this class.
-        if !self.target_belongs_to_class(class) {
+        if !self.target_belongs_to_class(class, target_text) {
             return;
         }
 
@@ -702,7 +1236,7 @@ impl<'a> LocalReferencesFinder<'a> {
     /// the value in a stub), and its nearest enclosing class must be `class` itself. A parameter or
     /// local that merely shares the name, or an attribute of a nested class, is not treated as the
     /// slot.
-    fn target_belongs_to_class(&self, class: &'a ast::StmtClassDef) -> bool {
+    fn target_belongs_to_class(&self, class: &'a ast::StmtClassDef, target_text: &str) -> bool {
         let db = self.model.db();
         let file = self.model.file();
         let class_range = class.range();
@@ -720,7 +1254,11 @@ impl<'a> LocalReferencesFinder<'a> {
             scope = node.parent()?;
         };
 
-        self.target_definitions.iter().any(|resolved| {
+        let Some(targets) = self.searches.for_name(target_text) else {
+            return false;
+        };
+
+        targets.definitions().any(|resolved| {
             let Some(definition) = resolved.definition() else {
                 return false;
             };

@@ -29,7 +29,10 @@ use self::class::ClassInstanceFlags;
 use self::cyclic::ActiveRecursionDetector;
 pub use self::cyclic::CycleDetector;
 pub(crate) use self::cyclic::TypeTransformer;
-pub use self::dedicated::pytest::{FixtureBinding, fixture_bindings_for_parameter};
+pub use self::dedicated::pytest::{
+    FixtureBinding, fixture_bindings_for_parameter, fixture_reference_candidates,
+    fixture_reference_identities, fixture_reference_search_files,
+};
 pub(crate) use self::diagnostic::TypeCheckDiagnostics;
 pub(crate) use self::diagnostic::register_lints;
 pub use self::diagnostic::{UNDEFINED_REVEAL, UNRESOLVED_REFERENCE};

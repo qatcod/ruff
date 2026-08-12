@@ -32,7 +32,7 @@ pub fn find_references(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::{CursorTest, IntoDiagnostic, cursor_test};
+    use crate::tests::{CursorTest, IntoDiagnostic, SitePackagesCursorTestBuilder, cursor_test};
     use insta::assert_snapshot;
     use ruff_db::diagnostic::{Annotation, Diagnostic, DiagnosticId, LintName, Severity, Span};
 
@@ -2238,5 +2238,569 @@ class C:
         9 |         print(self.x)
           |                    -
         ");
+    }
+
+    #[test]
+    fn references_pytest_fixture_relationships() {
+        let test = pytest_cursor_test(
+            r#"
+            import pytest
+
+            @pytest.fixture(name="resource")
+            def implementation<CURSOR>(): ...
+
+            copy = implementation
+
+            @pytest.fixture
+            def dependent(resource):
+                print(resource)
+
+            def test_use(resource):
+                print(resource)
+            "#,
+        );
+
+        assert_snapshot!(test.references(), @"
+        info[references]: Found 6 references
+          --> src/test_example.py:5:5
+           |
+         5 | def implementation(): ...
+           |     --------------
+         6 |
+         7 | copy = implementation
+           |        --------------
+         8 |
+         9 | @pytest.fixture
+        10 | def dependent(resource):
+           |               --------
+        11 |     print(resource)
+           |           --------
+        12 |
+        13 | def test_use(resource):
+           |              --------
+        14 |     print(resource)
+           |           --------
+        ");
+    }
+
+    #[test]
+    fn references_pytest_fixture_respect_conftest_shadowing() {
+        let mut builder = pytest_cursor_test_builder();
+        let test = builder
+            .source(
+                "conftest.py",
+                r#"
+                import pytest
+
+                @pytest.fixture
+                def resource<CURSOR>(): ...
+                "#,
+            )
+            .source(
+                "tests/test_outer.py",
+                r#"
+                def test_outer(resource):
+                    print(resource)
+                "#,
+            )
+            .source(
+                "tests/nested/conftest.py",
+                r#"
+                import pytest
+
+                @pytest.fixture
+                def resource(): ...
+                "#,
+            )
+            .source(
+                "tests/nested/test_inner.py",
+                r#"
+                def test_inner(resource):
+                    print(resource)
+                "#,
+            )
+            .build();
+
+        assert_snapshot!(test.references(), @"
+        info[references]: Found 3 references
+         --> src/conftest.py:5:5
+          |
+        5 | def resource(): ...
+          |     --------
+          |
+         ::: src/tests/test_outer.py:2:16
+          |
+        2 | def test_outer(resource):
+          |                --------
+        3 |     print(resource)
+          |           --------
+        ");
+    }
+
+    #[test]
+    fn references_pytest_imported_fixture_exposure() {
+        let mut builder = pytest_cursor_test_builder();
+        let test = builder
+            .source(
+                "fixtures.py",
+                r#"
+                import pytest
+
+                @pytest.fixture
+                def resource<CURSOR>(): ...
+                "#,
+            )
+            .source(
+                "test_example.py",
+                r#"
+                from fixtures import resource as alias
+
+                def test_use(alias):
+                    print(alias)
+                "#,
+            )
+            .build();
+
+        assert_snapshot!(test.references(), @"
+        info[references]: Found 5 references
+         --> src/fixtures.py:5:5
+          |
+        5 | def resource(): ...
+          |     --------
+          |
+         ::: src/test_example.py:2:22
+          |
+        2 | from fixtures import resource as alias
+          |                      --------    -----
+        3 |
+        4 | def test_use(alias):
+          |              -----
+        5 |     print(alias)
+          |           -----
+        ");
+
+        assert_snapshot!(test.references_without_declaration(), @"
+        info[references]: Found 1 references
+         --> src/test_example.py:5:11
+          |
+        5 |     print(alias)
+          |           -----
+        ");
+    }
+
+    #[test]
+    fn references_pytest_fixture_through_reexport() {
+        let mut builder = pytest_cursor_test_builder();
+        let test = builder
+            .source(
+                "fixtures.py",
+                r#"
+                import pytest
+
+                @pytest.fixture
+                def resource(): ...
+                "#,
+            )
+            .source(
+                "reexports.py",
+                r#"
+                from fixtures import resource as middle
+                "#,
+            )
+            .source(
+                "test_example.py",
+                r#"
+                from reexports import middle<CURSOR>
+
+                def test_use(middle):
+                    print(middle)
+                "#,
+            )
+            .build();
+
+        assert_snapshot!(test.references(), @"
+        info[references]: Found 6 references
+         --> src/fixtures.py:5:5
+          |
+        5 | def resource(): ...
+          |     --------
+          |
+         ::: src/reexports.py:2:22
+          |
+        2 | from fixtures import resource as middle
+          |                      --------    ------
+          |
+         ::: src/test_example.py:2:23
+          |
+        2 | from reexports import middle
+          |                       ------
+        3 |
+        4 | def test_use(middle):
+          |              ------
+        5 |     print(middle)
+          |           ------
+        ");
+    }
+
+    #[test]
+    fn references_function_local_fixture_import_as_ordinary_alias() {
+        let mut builder = pytest_cursor_test_builder();
+        let test = builder
+            .source(
+                "fixtures.py",
+                r#"
+                import pytest
+
+                @pytest.fixture
+                def resource(): ...
+                "#,
+            )
+            .source(
+                "test_example.py",
+                r#"
+                def helper():
+                    from fixtures import resource as local<CURSOR>
+                    print(local)
+                "#,
+            )
+            .build();
+
+        assert_snapshot!(test.references(), @"
+        info[references]: Found 2 references
+         --> src/test_example.py:3:38
+          |
+        3 |     from fixtures import resource as local
+          |                                      -----
+        4 |     print(local)
+          |           -----
+        ");
+    }
+
+    #[test]
+    fn references_pytest_fixture_does_not_expand_through_ambiguous_request() {
+        let test = ambiguous_pytest_fixture_cursor_test(
+            r#"
+            import pytest
+
+            @pytest.fixture
+            def first<CURSOR>(): ...
+            "#,
+            r#"
+            flag: bool
+            if flag:
+                from first import first as resource
+            else:
+                from second import second as resource
+
+            def test_ambiguous(resource):
+                print(resource)
+            "#,
+        );
+
+        assert_snapshot!(test.references(), @"
+        info[references]: Found 5 references
+         --> src/first.py:5:5
+          |
+        5 | def first(): ...
+          |     -----
+          |
+         ::: src/test_ambiguous.py:4:23
+          |
+        4 |     from first import first as resource
+          |                       -----    --------
+        5 | else:
+        6 |     from second import second as resource
+        7 |
+        8 | def test_ambiguous(resource):
+          |                    --------
+        9 |     print(resource)
+          |           --------
+        ");
+    }
+
+    #[test]
+    fn references_ambiguous_pytest_fixture_request_includes_all_targets() {
+        let test = ambiguous_pytest_fixture_cursor_test(
+            r#"
+            import pytest
+
+            @pytest.fixture
+            def first(): ...
+            "#,
+            r#"
+            flag: bool
+            if flag:
+                from first import first as resource
+            else:
+                from second import second as resource
+
+            def test_ambiguous(resource<CURSOR>):
+                print(resource)
+            "#,
+        );
+
+        assert_snapshot!(test.references(), @"
+        info[references]: Found 12 references
+         --> src/first.py:5:5
+          |
+        5 | def first(): ...
+          |     -----
+          |
+         ::: src/second.py:5:5
+          |
+        5 | def second(): ...
+          |     ------
+          |
+         ::: src/test_ambiguous.py:4:23
+          |
+        4 |     from first import first as resource
+          |                       -----    --------
+        5 | else:
+        6 |     from second import second as resource
+          |                        ------    --------
+        7 |
+        8 | def test_ambiguous(resource):
+          |                    --------
+        9 |     print(resource)
+          |           --------
+          |
+         ::: src/test_second.py:2:20
+          |
+        2 | from second import second as resource
+          |                    ------    --------
+        3 |
+        4 | def test_second(resource):
+          |                 --------
+        5 |     print(resource)
+          |           --------
+        ");
+    }
+
+    #[test]
+    fn references_pytest_fixture_preserves_non_fixture_ambiguous_target() {
+        let test = pytest_cursor_test(
+            r#"
+            import pytest
+
+            flag: bool
+            if flag:
+                @pytest.fixture
+                def resource(): ...
+            else:
+                def resource(): ...
+
+            resource<CURSOR>()
+            "#,
+        );
+
+        assert_snapshot!(test.references(), @"
+        info[references]: Found 3 references
+          --> src/test_example.py:7:9
+           |
+         7 |     def resource(): ...
+           |         --------
+         8 | else:
+         9 |     def resource(): ...
+           |         --------
+        10 |
+        11 | resource()
+           | --------
+        ");
+    }
+
+    #[test]
+    fn references_pytest_installed_core_fixture() {
+        let test = pytest_cursor_test(
+            r#"
+            def test_use(tmp_path<CURSOR>):
+                print(tmp_path)
+            "#,
+        );
+
+        assert_snapshot!(test.references(), @"
+        info[references]: Found 3 references
+         --> site-packages/_pytest/tmpdir.py:5:5
+          |
+        5 | def tmp_path(): ...
+          |     --------
+          |
+         ::: src/test_example.py:2:14
+          |
+        2 | def test_use(tmp_path):
+          |              --------
+        3 |     print(tmp_path)
+          |           --------
+        ");
+    }
+
+    #[test]
+    fn references_pytest_fixture_declaration_through_external_stub() {
+        let import_test = external_stub_fixture_cursor_test(
+            r#"
+            from third_party_plugin import external_resource<CURSOR> as resource
+
+            def test_use(resource):
+                print(resource)
+            "#,
+        );
+        let parameter_test = external_stub_fixture_cursor_test(
+            r#"
+            from third_party_plugin import external_resource as resource
+
+            def test_use(resource<CURSOR>):
+                print(resource)
+            "#,
+        );
+        let references = import_test.references();
+        assert_eq!(references, parameter_test.references());
+
+        assert_snapshot!(references, @"
+        info[references]: Found 6 references
+         --> site-packages/third_party_plugin.py:5:5
+          |
+        5 | def external_resource(): ...
+          |     -----------------
+          |
+         ::: site-packages/third_party_plugin.pyi:2:5
+          |
+        2 | def external_resource() -> object: ...
+          |     -----------------
+          |
+         ::: src/test_example.py:2:32
+          |
+        2 | from third_party_plugin import external_resource as resource
+          |                                -----------------    --------
+        3 |
+        4 | def test_use(resource):
+          |              --------
+        5 |     print(resource)
+          |           --------
+        ");
+    }
+
+    fn external_stub_fixture_cursor_test(test_source: &str) -> CursorTest {
+        let mut builder = pytest_cursor_test_builder();
+        builder
+            .site_packages(
+                "third_party_plugin.py",
+                r#"
+                import pytest
+
+                @pytest.fixture
+                def external_resource(): ...
+                "#,
+            )
+            .site_packages(
+                "third_party_plugin.pyi",
+                r#"
+                def external_resource() -> object: ...
+                "#,
+            )
+            .source("test_example.py", test_source)
+            .build()
+    }
+
+    fn ambiguous_pytest_fixture_cursor_test(
+        first_fixture: &str,
+        ambiguous_test: &str,
+    ) -> CursorTest {
+        let mut builder = pytest_cursor_test_builder();
+        builder
+            .source("first.py", first_fixture)
+            .source(
+                "second.py",
+                r#"
+                import pytest
+
+                @pytest.fixture
+                def second(): ...
+                "#,
+            )
+            .source("test_ambiguous.py", ambiguous_test)
+            .source(
+                "test_second.py",
+                r#"
+                from second import second as resource
+
+                def test_second(resource):
+                    print(resource)
+                "#,
+            )
+            .build()
+    }
+
+    fn pytest_cursor_test(source: &str) -> CursorTest {
+        pytest_cursor_test_builder()
+            .source("test_example.py", source)
+            .build()
+    }
+
+    fn pytest_cursor_test_builder() -> SitePackagesCursorTestBuilder {
+        let mut builder = CursorTest::builder().with_site_packages();
+        builder
+            .site_packages(
+                "_pytest/__init__.py",
+                r#"
+                "#,
+            )
+            .site_packages(
+                "_pytest/__init__.pyi",
+                r#"
+                "#,
+            )
+            .site_packages(
+                "_pytest/config/__init__.py",
+                r#"
+                default_plugins = ("tmpdir",)
+                "#,
+            )
+            .site_packages(
+                "_pytest/mark/__init__.pyi",
+                r#"
+                "#,
+            )
+            .site_packages(
+                "_pytest/mark/structures.pyi",
+                r#"
+                class MarkDecorator:
+                    def __call__(self, *args: object, **kwargs: object) -> object: ...
+
+                class _ParametrizeMarkDecorator(MarkDecorator): ...
+
+                class MarkGenerator:
+                    parametrize: _ParametrizeMarkDecorator
+                "#,
+            )
+            .site_packages(
+                "_pytest/fixtures.pyi",
+                r#"
+                from typing import Any, Callable
+
+                def fixture(
+                    function: Callable[..., Any] | None = ...,
+                    *,
+                    name: str | None = ...,
+                ) -> Any: ...
+                "#,
+            )
+            .site_packages(
+                "_pytest/tmpdir.py",
+                r#"
+                from _pytest.fixtures import fixture
+
+                @fixture
+                def tmp_path(): ...
+                "#,
+            )
+            .site_packages(
+                "pytest/__init__.pyi",
+                r#"
+                from _pytest.fixtures import fixture as fixture
+                from _pytest.mark.structures import MarkGenerator
+
+                mark: MarkGenerator
+                "#,
+            );
+        builder
     }
 }

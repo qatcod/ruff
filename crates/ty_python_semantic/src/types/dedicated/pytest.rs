@@ -226,8 +226,7 @@ impl<'db> FixtureBinding<'db> {
 }
 
 /// Returns non-project files that should be searched for pytest fixture references.
-#[expect(dead_code, reason = "used by the follow-up IDE integration")]
-fn fixture_reference_search_files<'db>(
+pub fn fixture_reference_search_files<'db>(
     db: &'db dyn Db,
     program: Program<'db>,
 ) -> &'db [ProgramFile<'db>] {
@@ -344,7 +343,7 @@ fn pytest_legacy_tmpdir_plugin<'db>(
 /// - a non-variadic parameter that represents a fixture request on a collected test or available
 ///   fixture function.
 #[salsa::tracked(returns(ref), heap_size=ruff_memory_usage::heap_size)]
-fn fixture_reference_candidates<'db>(
+pub fn fixture_reference_candidates<'db>(
     db: &'db dyn Db,
     file: ProgramFile<'db>,
 ) -> Box<[Definition<'db>]> {
@@ -448,7 +447,7 @@ fn fixture_reference_candidates<'db>(
 /// can then be intersected with the `fixture_reference_identities` of a different
 /// definition, to determine if the two belong to the same reference family.
 #[salsa::tracked(returns(ref), heap_size=ruff_memory_usage::heap_size)]
-fn fixture_reference_identities<'db>(
+pub fn fixture_reference_identities<'db>(
     db: &'db dyn Db,
     definition: Definition<'db>,
 ) -> Box<[Definition<'db>]> {

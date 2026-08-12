@@ -259,6 +259,13 @@ impl<'db> Definitions<'db> {
         Self(resolved)
     }
 
+    /// Adds `definition` unless the same resolved definition is already present.
+    pub(crate) fn insert(&mut self, definition: ResolvedDefinition<'db>) {
+        if !self.0.contains(&definition) {
+            self.0.push(definition);
+        }
+    }
+
     pub(crate) fn from_ty(
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,

@@ -78,6 +78,7 @@ use ty_python_semantic::ProgramEnvironment;
 use ty_python_semantic::types::{Type, TypeDefinition};
 
 type FxIndexMap<K, V> = indexmap::IndexMap<K, V, FxBuildHasher>;
+type FxIndexSet<V> = indexmap::IndexSet<V, FxBuildHasher>;
 
 /// Information associated with a text range.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
