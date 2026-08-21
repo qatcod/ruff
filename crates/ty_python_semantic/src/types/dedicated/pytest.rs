@@ -65,6 +65,10 @@ use crate::types::{
 };
 use crate::{Db, FxIndexSet};
 
+mod collection;
+
+pub use collection::{PytestTest, PytestTestKind, pytest_tests_in_file};
+
 /// Resolves pytest fixtures requested by `parameter`.
 ///
 /// This function can be used to resolve either a fixture requested by a test
