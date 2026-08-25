@@ -2262,6 +2262,13 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         }
     }
 
+    /// Records a complete boolean test before visiting its subexpressions.
+    fn visit_condition(&mut self, test: &'ast ast::Expr) {
+        self.current_use_def_map_mut()
+            .record_boolean_test_context(test.range());
+        self.visit_expr_with_context(test, ExpressionContext::Condition);
+    }
+
     /// Adds a new predicate to the list of all predicates, but does not record it. Returns the
     /// predicate ID for later recording using
     /// [`SemanticIndexBuilder::record_narrowing_constraint_id_for_places`].
@@ -3076,7 +3083,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
     /// print(last)
     /// ```
     fn visit_comprehension_filter(&mut self, if_expr: &'ast ast::Expr) -> FlowSnapshot {
-        self.visit_expr_with_context(if_expr, ExpressionContext::Condition);
+        self.visit_condition(if_expr);
         let condition_flow_snapshot = self.flow_snapshot_for_condition(if_expr);
         let filtered_out = if let Some(snapshots) = condition_flow_snapshot.into_branches() {
             self.flow_restore(snapshots.truthy);
@@ -3542,6 +3549,10 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 self.record_exception_checkpoint();
             }
             ast::Expr::UnaryOp(unary) => {
+                if unary.op == ast::UnaryOp::Not {
+                    self.current_use_def_map_mut()
+                        .record_boolean_test_context(unary.operand.range());
+                }
                 self.visit_expr_with_context(
                     &unary.operand,
                     if unary.op == ast::UnaryOp::Not {
@@ -3599,7 +3610,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         let ast::ExprIf {
             body, test, orelse, ..
         } = node;
-        self.visit_expr_with_context(test, ExpressionContext::Condition);
+        self.visit_condition(test);
         let condition_flow_snapshot = self.flow_snapshot_for_condition(test);
         let falsy = if let Some(snapshots) = condition_flow_snapshot.into_branches() {
             self.flow_restore(snapshots.truthy);
@@ -4190,7 +4201,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 // `msg` branch back into the following flow, since there is no way of getting out
                 // of that branch. Code after the assertion starts from the condition's truthy flow.
 
-                self.visit_expr_with_context(test, ExpressionContext::Condition);
+                self.visit_condition(test);
                 let condition_flow_snapshot = self.flow_snapshot_for_condition(test);
                 let predicate = self.build_predicate(test, ExpressionContext::Condition);
 
@@ -4363,7 +4374,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 }
             }
             ast::Stmt::If(node) => {
-                self.visit_expr_with_context(&node.test, ExpressionContext::Condition);
+                self.visit_condition(&node.test);
                 let condition_flow_snapshot = self.flow_snapshot_for_condition(&node.test);
                 let mut falsy = if let Some(snapshots) = condition_flow_snapshot.into_branches() {
                     self.flow_restore(snapshots.truthy);
@@ -4417,7 +4428,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                     self.record_negated_reachability_constraint(last_reachability_constraint);
 
                     let next_falsy = if let Some(elif_test) = clause_test {
-                        self.visit_expr_with_context(elif_test, ExpressionContext::Condition);
+                        self.visit_condition(elif_test);
                         // A test expression is evaluated whether the branch is taken or not
                         let condition_flow_snapshot = self.flow_snapshot_for_condition(elif_test);
                         let next_falsy =
@@ -4500,7 +4511,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
 
                 // Visit the test expression after creating loop headers, so that loop-back values
                 // are visible.
-                self.visit_expr_with_context(test, ExpressionContext::Condition);
+                self.visit_condition(test);
                 let condition_flow_snapshot = self.flow_snapshot_for_condition(test);
 
                 // Take the pre_loop snapshot from the post-test fallback flow before restoring the
@@ -4878,7 +4889,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                     // while the next case is reached through `!P || (P && !G)`. Save `P && !G`
                     // separately so it can be merged with the pattern-failure state after the body.
                     let match_success_guard_failure = case.guard.as_ref().map(|guard| {
-                        self.visit_expr_with_context(guard, ExpressionContext::Condition);
+                        self.visit_condition(guard);
                         let condition_flow_snapshot = self.flow_snapshot_for_condition(guard);
                         let falsy = if let Some(snapshots) = condition_flow_snapshot.into_branches()
                         {
