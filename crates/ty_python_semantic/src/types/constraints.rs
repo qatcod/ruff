@@ -1957,7 +1957,7 @@ impl<'db> ConstraintBounds<'db> {
         iter::chain(self.lower, self.upper).all(|bound| {
             let bound = bound.ty();
             !bound.has_typevar(db, env)
-                && !bound.has_unspecialized_type_var(db, env)
+                && !bound.has_provisional_marker(db, env)
                 && bound.bottom_materialization(db, env) == bound.top_materialization(db, env)
         })
     }
@@ -4061,7 +4061,7 @@ impl<'db> PathBounds<'db> {
                     let mut bounds = iter::chain(constraint.bounds.lower, constraint.bounds.upper)
                         .map(ConstraintBound::ty);
                     if bounds.any(|bound| {
-                        bound.has_typevar(db, env) || bound.has_unspecialized_type_var(db, env)
+                        bound.has_typevar(db, env) || bound.has_provisional_marker(db, env)
                     }) {
                         return ControlFlow::Continue(None);
                     }
