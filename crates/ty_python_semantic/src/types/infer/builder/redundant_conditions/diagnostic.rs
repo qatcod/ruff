@@ -14,9 +14,7 @@ use ruff_python_ast::{
 use ruff_python_trivia::indentation_at_offset;
 use ruff_source_file::{LineRanges, UniversalNewlineIterator, find_newline};
 use ruff_text_size::{Ranged, TextRange};
-use ty_module_resolver::{
-    ImportingFile, KnownModule, SearchPath, file_to_module, resolve_real_shadowable_module,
-};
+use ty_module_resolver::{SearchPath, file_to_module};
 use ty_python_core::{
     Truthiness,
     definition::DefinitionKind,
@@ -26,13 +24,12 @@ use ty_python_core::{
 
 use crate::{
     SemanticModel,
-    dependency::is_direct_dependency,
     importer::ImportRequest,
-    place::imported_symbol,
     types::{
         KnownClass, LintDiagnosticGuard, LintDiagnosticGuardBuilder, MemberLookupPolicy, Type,
         TypeContext,
         call::bind::CallableDescription,
+        diagnostic::typing_module_for_fix,
         function::KnownFunction,
         infer::{InferenceFlags, TypeInferenceBuilder},
         infer_definition_types, infer_scope_types,
@@ -726,41 +723,12 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
     /// The fix is unsafe because the new branch raises if the static assumptions fail at runtime.
     fn add_assert_never_else(&self, clause: &ast::ElifElseClause, test: &ast::Expr) -> Option<Fix> {
         let db = self.db();
-        let env = self.program_environment();
         let first_statement = clause.body.first()?;
         let source = source_text(db, self.file());
         let indentation = indentation_at_offset(clause.start(), &source)?;
         let argument = self.assert_never_argument(test)?;
 
-        let module = if env.python_version(db) >= PythonVersion::PY311 {
-            KnownModule::Typing
-        } else {
-            KnownModule::TypingExtensions
-        };
-        let model = SemanticModel::new(db, self.program_file());
-        let resolved = model.resolve_module(Some(module.as_str()), 0)?;
-        if !resolved.is_known(db, module)
-            || (module == KnownModule::TypingExtensions
-                && !is_direct_dependency(db, self.program_file(), resolved))
-        {
-            return None;
-        }
-        if module == KnownModule::TypingExtensions {
-            // The bundled stub includes `assert_never` even when the installed backport is too
-            // old to provide it. Check the runtime module's exports before adding a runtime import.
-            let runtime_module = resolve_real_shadowable_module(
-                db,
-                ImportingFile::File(self.file(), self.program_file().resolver_environment(db)),
-                &module.name(),
-            )?;
-            let runtime_file = env.program(db).program_file(db, runtime_module.file(db)?);
-            if !imported_symbol(db, env, Some(runtime_file), "assert_never", None)
-                .place
-                .is_definitely_bound()
-            {
-                return None;
-            }
-        }
+        let module = typing_module_for_fix(&self.context, "assert_never", PythonVersion::PY311)?;
         let importer = self.context.importer();
         let action = importer.import_for_diagnostic(
             ImportRequest::import_from(module.as_str(), "assert_never"),

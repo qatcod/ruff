@@ -11,7 +11,7 @@ use super::{
 };
 use crate::dependency::is_direct_dependency;
 use crate::diagnostic::{did_you_mean, format_enumeration};
-use crate::importer::{ImportRequest, MembersInScope};
+use crate::importer::{ImportAction, ImportRequest, MembersInScope};
 use crate::lint::{Level, LintRegistryBuilder, LintStatus};
 use crate::place::{DefinedPlace, Place, imported_symbol, place_from_bindings};
 use crate::suppression::FileSuppressionId;
@@ -52,7 +52,7 @@ use ruff_python_ast::name::Name;
 use ruff_python_ast::token::parentheses_iterator;
 use ruff_python_ast::{self as ast, AnyNodeRef, HasNodeIndex, PythonVersion, StringFlags};
 use ruff_source_file::LineRanges;
-use ruff_text_size::{Ranged, TextRange};
+use ruff_text_size::{Ranged, TextRange, TextSize};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::fmt::{self, Formatter};
 use ty_module_resolver::{
@@ -3059,6 +3059,81 @@ pub(super) fn report_possibly_missing_attribute(
     };
 }
 
+/// Selects a runtime typing module for a fix, checking declared dependencies and installed exports
+/// when the requested member needs a backport.
+pub(super) fn typing_module_for_fix(
+    context: &InferContext,
+    member: &str,
+    minimum_version: PythonVersion,
+) -> Option<KnownModule> {
+    let db = context.db();
+    let env = context.program_environment();
+    let module = if env.python_version(db) >= minimum_version {
+        KnownModule::Typing
+    } else {
+        KnownModule::TypingExtensions
+    };
+    let model = SemanticModel::new(db, context.program_file());
+    let resolved = model.resolve_module(Some(module.as_str()), 0)?;
+    if !resolved.is_known(db, module)
+        || (module == KnownModule::TypingExtensions
+            && !is_direct_dependency(db, context.program_file(), resolved))
+    {
+        return None;
+    }
+    if module == KnownModule::TypingExtensions {
+        // Bundled stubs can export a member that the installed backport does not provide.
+        // A dependency declaration alone is therefore insufficient for a runtime import.
+        let runtime_module = resolve_real_shadowable_module(
+            db,
+            ImportingFile::File(
+                context.file(),
+                context.program_file().resolver_environment(db),
+            ),
+            &module.name(),
+        )?;
+        let runtime_file = env.program(db).program_file(db, runtime_module.file(db)?);
+        if !imported_symbol(db, env, Some(runtime_file), member, None)
+            .place
+            .is_definitely_bound()
+        {
+            return None;
+        }
+    }
+    Some(module)
+}
+
+pub(super) fn import_literal_for_fix(context: &InferContext, at: TextSize) -> Option<ImportAction> {
+    let module = typing_module_for_fix(context, "Literal", PythonVersion::PY38)?;
+    context.importer().import_for_diagnostic(
+        ImportRequest::import_from(module.as_str(), "Literal"),
+        context.scope().file_scope_id(context.db()),
+        at,
+    )
+}
+
+/// Wraps a literal in `Literal[...]`, preserving its spelling, quotes, and escapes.
+/// String annotations retain their original source offsets: `parse_string_annotation` rejects
+/// contents that require unescaping, and parses accepted strings directly from the source file.
+pub(super) fn autofix_with_literal(
+    context: &InferContext,
+    diagnostic: &mut Diagnostic,
+    node: impl Ranged,
+) {
+    let Some(action) = import_literal_for_fix(context, node.start()) else {
+        return;
+    };
+    let source = source_text(context.db(), context.file());
+    diagnostic.help("Wrap in `Literal[...]`");
+    diagnostic.set_fix(Fix::unsafe_edits(
+        Edit::range_replacement(
+            format!("{}[{}]", action.symbol_text(), &source[node.range()]),
+            node.range(),
+        ),
+        action.import().cloned(),
+    ));
+}
+
 pub(super) fn report_undefined_reveal(context: &InferContext, name: &ast::ExprName) {
     let Some(builder) = context.report_lint(&UNDEFINED_REVEAL, name) else {
         return;
@@ -3066,44 +3141,10 @@ pub(super) fn report_undefined_reveal(context: &InferContext, name: &ast::ExprNa
     let mut diagnostic = builder.into_diagnostic("`reveal_type` used without importing it");
     diagnostic.info("This is allowed for debugging convenience but will fail at runtime");
 
-    let db = context.db();
-    let env = context.program_environment();
-    let module = if env.python_version(db) >= PythonVersion::PY311 {
-        "typing"
-    } else {
-        let model = SemanticModel::new(db, context.program_file());
-        let Some(module) = model.resolve_module(Some("typing_extensions"), 0) else {
-            return;
-        };
-        // Bundled stubs make the module available for type checking even when the project
-        // does not declare it. Only add a runtime import with positive dependency evidence.
-        if !module.is_known(db, KnownModule::TypingExtensions)
-            || !is_direct_dependency(db, context.program_file(), module)
-        {
-            return;
-        }
-        // The bundled stub includes `reveal_type` even when the installed backport is too
-        // old to provide it. Check the runtime module's exports before adding a runtime import.
-        let Some(runtime_file) = resolve_real_shadowable_module(
-            db,
-            ImportingFile::File(
-                context.file(),
-                context.program_file().resolver_environment(db),
-            ),
-            &KnownModule::TypingExtensions.name(),
-        )
-        .and_then(|module| module.file(db)) else {
-            return;
-        };
-        let runtime_file = env.program(db).program_file(db, runtime_file);
-        if !imported_symbol(db, env, Some(runtime_file), "reveal_type", None)
-            .place
-            .is_definitely_bound()
-        {
-            return;
-        }
-        "typing_extensions"
+    let Some(module) = typing_module_for_fix(context, "reveal_type", PythonVersion::PY311) else {
+        return;
     };
+    let module = module.as_str();
     // `reveal_type` is unbound. Force a `from` import to avoid introducing a module name
     // that might be shadowed, without querying inferred types while emitting a diagnostic.
     let action = context.importer().import(
