@@ -2292,6 +2292,673 @@ def multiline_conditions(value: int):
     # fmt: on
 ```
 
+## Adding an exhaustiveness check after a redundant final `elif`
+
+```toml
+[environment]
+python-version = "3.11"
+
+[rules]
+redundant-condition-strict = "error"
+```
+
+When a final `elif` condition is always true, an `else` branch calling `assert_never` makes the
+exhaustiveness check explicit. The argument is a variable that narrows to `Never` when the condition
+is false. The original condition and body are preserved:
+
+```py
+def exhaustive(value: str | int):
+    if isinstance(value, str):
+        print(value)
+    elif isinstance(value, int):  # snapshot: redundant-condition-strict
+        print(value)
+        print(value + 1)
+```
+
+```snapshot
+error[redundant-condition-strict]: Condition is always true
+ --> src/mdtest_snippet.py:4:10
+  |
+4 |     elif isinstance(value, int):  # snapshot: redundant-condition-strict
+  |          ^^^^^^^^^^^^^^^^^^^^^^ Inferred type is `Literal[True]`
+help: Add an `else` branch that calls `assert_never`
+   |
+1  + from typing import assert_never
+2  | def exhaustive(value: str | int):
+--------------------------------------------------------------------------------
+7  |         print(value + 1)
+8  +     else:
+9  +         assert_never(value)
+10 | # fmt: off
+   |
+note: This is an unsafe fix and may change runtime behavior
+```
+
+The assertion uses the existing indentation of the branch body, including unconventional
+indentation:
+
+```py
+# fmt: off
+def unconventional_indentation(value: str | int):
+  if isinstance(value, str):
+    print(value)
+  elif isinstance(value, int):  # snapshot: redundant-condition-strict
+    print(value)
+# fmt: on
+```
+
+```snapshot
+error[redundant-condition-strict]: Condition is always true
+  --> src/mdtest_snippet.py:11:8
+   |
+11 |   elif isinstance(value, int):  # snapshot: redundant-condition-strict
+   |        ^^^^^^^^^^^^^^^^^^^^^^ Inferred type is `Literal[True]`
+help: Add an `else` branch that calls `assert_never`
+   |
+1  + from typing import assert_never
+2  | def exhaustive(value: str | int):
+--------------------------------------------------------------------------------
+13 |     print(value)
+14 +   else:
+15 +     assert_never(value)
+16 | # fmt: on
+   |
+note: This is an unsafe fix and may change runtime behavior
+```
+
+Comments inside a parenthesized condition, after the branch header, and in its body are all
+preserved. Trailing body comments remain before the new `else`:
+
+```py
+def commented_condition(value: str | int):
+    if isinstance(value, str):
+        print(value)
+    elif (
+        # Explain the defensive runtime check.
+        isinstance(value, int)  # snapshot: redundant-condition-strict
+    ):  # Preserve this header comment.
+        # Preserve this body comment.
+        print(value)
+        # Preserve this trailing body comment.
+```
+
+```snapshot
+error[redundant-condition-strict]: Condition is always true
+  --> src/mdtest_snippet.py:19:9
+   |
+19 |         isinstance(value, int)  # snapshot: redundant-condition-strict
+   |         ^^^^^^^^^^^^^^^^^^^^^^ Inferred type is `Literal[True]`
+help: Add an `else` branch that calls `assert_never`
+   |
+1  + from typing import assert_never
+2  | def exhaustive(value: str | int):
+--------------------------------------------------------------------------------
+24 |         # Preserve this trailing body comment.
+25 +     else:
+26 +         assert_never(value)
+27 | def assignment_expression(value: str | int):
+   |
+note: This is an unsafe fix and may change runtime behavior
+```
+
+No fix is offered for an assignment expression: the new branch could observe a variable whose value
+the condition has changed:
+
+```py
+def assignment_expression(value: str | int):
+    if isinstance(value, str):
+        print(value)
+    elif matched := isinstance(value, int):  # snapshot: redundant-condition-strict
+        print(matched)
+```
+
+```snapshot
+error[redundant-condition-strict]: Condition is always true
+  --> src/mdtest_snippet.py:27:10
+   |
+27 |     elif matched := isinstance(value, int):  # snapshot: redundant-condition-strict
+   |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Inferred type is `Literal[True]`
+```
+
+If the branch body begins on the same line as its header, the new `else` still goes on a separate
+line. Its body uses the file's indentation style:
+
+```py
+# fmt: off
+def inline_branch(value: str | int):
+    if isinstance(value, str):
+        print(value)
+    elif isinstance(value, int): print(value)  # snapshot: redundant-condition-strict
+# fmt: on
+```
+
+```snapshot
+error[redundant-condition-strict]: Condition is always true
+  --> src/mdtest_snippet.py:33:10
+   |
+33 |     elif isinstance(value, int): print(value)  # snapshot: redundant-condition-strict
+   |          ^^^^^^^^^^^^^^^^^^^^^^ Inferred type is `Literal[True]`
+help: Add an `else` branch that calls `assert_never`
+   |
+1  + from typing import assert_never
+2  | def exhaustive(value: str | int):
+--------------------------------------------------------------------------------
+34 |     elif isinstance(value, int): print(value)  # snapshot: redundant-condition-strict
+35 +     else:
+36 +         assert_never(value)
+37 | # fmt: on
+   |
+note: This is an unsafe fix and may change runtime behavior
+```
+
+A multiline header can also have a body on the same line as its closing colon:
+
+```py
+# fmt: off
+def multiline_inline_branch(value: str | int):
+    if isinstance(value, str):
+        print(value)
+    elif (
+        isinstance(value, int)  # snapshot: redundant-condition-strict
+    ): print(value)
+# fmt: on
+```
+
+```snapshot
+error[redundant-condition-strict]: Condition is always true
+  --> src/mdtest_snippet.py:40:9
+   |
+40 |         isinstance(value, int)  # snapshot: redundant-condition-strict
+   |         ^^^^^^^^^^^^^^^^^^^^^^ Inferred type is `Literal[True]`
+help: Add an `else` branch that calls `assert_never`
+   |
+1  + from typing import assert_never
+2  | def exhaustive(value: str | int):
+--------------------------------------------------------------------------------
+42 |     ): print(value)
+43 +     else:
+44 +         assert_never(value)
+45 | # fmt: on
+   |
+note: This is an unsafe fix and may change runtime behavior
+```
+
+Parser recovery can produce an `elif` branch with no statements. The redundant condition is still
+reported, but no autofix is offered for the incomplete branch:
+
+```py
+def empty_branch(value: str | int):
+    if isinstance(value, str):
+        print(value)
+    # error: [invalid-syntax] "Expected an indented block after `elif` clause"
+    elif isinstance(value, int):  # snapshot: redundant-condition-strict
+```
+
+```snapshot
+error[redundant-condition-strict]: Condition is always true
+  --> src/mdtest_snippet.py:47:10
+   |
+47 |     elif isinstance(value, int):  # snapshot: redundant-condition-strict
+   |          ^^^^^^^^^^^^^^^^^^^^^^ Inferred type is `Literal[True]`
+```
+
+A boolean `elif` following a non-boolean condition still receives the exhaustiveness fix. The type
+of the first condition does not determine how later conditions are diagnosed.
+
+```py
+def non_boolean_first_condition(items: list[int], value: int):
+    if items:
+        print(items)
+    elif value is not None:  # snapshot: redundant-condition-strict
+        print(value)
+```
+
+```snapshot
+error[redundant-condition-strict]: Condition is always true
+  --> src/mdtest_snippet.py:51:10
+   |
+51 |     elif value is not None:  # snapshot: redundant-condition-strict
+   |          -----^^^^^^^^^^^^
+   |          |
+   |          Has type `int`
+help: Add an `else` branch that calls `assert_never`
+   |
+1  + from typing import assert_never
+2  | def exhaustive(value: str | int):
+--------------------------------------------------------------------------------
+52 |     elif value is not None:  # snapshot: redundant-condition-strict
+   -         print(value)
+53 +         print(value)
+54 +     else:
+55 +         assert_never(value)
+   |
+note: This is an unsafe fix and may change runtime behavior
+```
+
+## Exhaustiveness checks for comparisons
+
+Equality comparisons can narrow a literal union to `Never`. The new assertion reuses the tested
+variable rather than evaluating the comparison again:
+
+```py
+from typing import Literal
+
+def exhaustive(value: Literal["a", "b"]):
+    if value == "a":
+        print(value)
+    elif "b" == value:  # snapshot: redundant-condition-strict
+        print(value)
+```
+
+```snapshot
+error[redundant-condition-strict]: Condition is always true
+ --> src/mdtest_snippet.py:6:10
+  |
+6 |     elif "b" == value:  # snapshot: redundant-condition-strict
+  |          ---^^^^-----
+  |          |      |
+  |          |      Has type `Literal["b"]`
+  |          Has type `Literal["b"]`
+help: Add an `else` branch that calls `assert_never`
+  |
+  - from typing import Literal
+1 + from typing import Literal, assert_never
+2 |
+--------------------------------------------------------------------------------
+6 |     elif "b" == value:  # snapshot: redundant-condition-strict
+  -         print(value)
+7 +         print(value)
+8 +     else:
+9 +         assert_never(value)
+  |
+note: This is an unsafe fix and may change runtime behavior
+```
+
+## Exhaustiveness checks with imported aliases
+
+An existing runtime import of `assert_never` can be reused, including an alias:
+
+```py
+from typing import assert_never as unreachable
+
+def exhaustive(value: str | int):
+    if isinstance(value, str):
+        print(value)
+    elif isinstance(value, int):  # snapshot: redundant-condition-strict
+        print(value)
+```
+
+```snapshot
+error[redundant-condition-strict]: Condition is always true
+ --> src/mdtest_snippet.py:6:10
+  |
+6 |     elif isinstance(value, int):  # snapshot: redundant-condition-strict
+  |          ^^^^^^^^^^^^^^^^^^^^^^ Inferred type is `Literal[True]`
+help: Add an `else` branch that calls `assert_never`
+  |
+6 |     elif isinstance(value, int):  # snapshot: redundant-condition-strict
+  -         print(value)
+7 +         print(value)
+8 +     else:
+9 +         unreachable(value)
+  |
+note: This is an unsafe fix and may change runtime behavior
+```
+
+## Exhaustiveness checks with qualified imports
+
+A qualified module import can also be reused. The assertion goes after the entire branch body,
+including nested statements:
+
+```py
+import typing as t
+
+def exhaustive(value: str | int, flag: bool):
+    if isinstance(value, str):
+        print(value)
+    elif isinstance(value, int):  # snapshot: redundant-condition-strict
+        if flag:
+            print(value)
+        # This comment belongs to the `elif` body.
+    print("done")
+```
+
+```snapshot
+error[redundant-condition-strict]: Condition is always true
+ --> src/mdtest_snippet.py:6:10
+  |
+6 |     elif isinstance(value, int):  # snapshot: redundant-condition-strict
+  |          ^^^^^^^^^^^^^^^^^^^^^^ Inferred type is `Literal[True]`
+help: Add an `else` branch that calls `assert_never`
+   |
+9  |         # This comment belongs to the `elif` body.
+10 +     else:
+11 +         t.assert_never(value)
+12 |     print("done")
+   |
+note: This is an unsafe fix and may change runtime behavior
+```
+
+## Exhaustiveness checks with a shadowed function name
+
+When `assert_never` is already bound, a qualified import avoids that binding:
+
+```py
+def exhaustive(value: str | int, assert_never: int):
+    if isinstance(value, str):
+        print(value)
+    elif isinstance(value, int):  # snapshot: redundant-condition-strict
+        print(value, assert_never)
+```
+
+```snapshot
+error[redundant-condition-strict]: Condition is always true
+ --> src/mdtest_snippet.py:4:10
+  |
+4 |     elif isinstance(value, int):  # snapshot: redundant-condition-strict
+  |          ^^^^^^^^^^^^^^^^^^^^^^ Inferred type is `Literal[True]`
+help: Add an `else` branch that calls `assert_never`
+  |
+1 + import typing
+2 | def exhaustive(value: str | int, assert_never: int):
+3 |     if isinstance(value, str):
+4 |         print(value)
+5 |     elif isinstance(value, int):  # snapshot: redundant-condition-strict
+  -         print(value, assert_never)
+6 +         print(value, assert_never)
+7 +     else:
+8 +         typing.assert_never(value)
+  |
+note: This is an unsafe fix and may change runtime behavior
+```
+
+## Exhaustiveness checks with shadowed imports
+
+When both the function and module names are shadowed, no fix is offered. An import elsewhere in the
+module does not make a shadowed alias usable:
+
+```py
+import typing as t
+from typing import assert_never
+
+def exhaustive(value: str | int, t: int, typing: int, assert_never: int):
+    if isinstance(value, str):
+        print(value)
+    elif isinstance(value, int):  # snapshot: redundant-condition-strict
+        print(value)
+```
+
+```snapshot
+error[redundant-condition-strict]: Condition is always true
+ --> src/mdtest_snippet.py:7:10
+  |
+7 |     elif isinstance(value, int):  # snapshot: redundant-condition-strict
+  |          ^^^^^^^^^^^^^^^^^^^^^^ Inferred type is `Literal[True]`
+```
+
+## Exhaustiveness checks with a deleted import
+
+An imported alias that has been deleted cannot be reused. A new qualified import provides a runtime
+binding for the assertion:
+
+```py
+from typing import assert_never as unreachable
+
+del unreachable
+
+def exhaustive(value: str | int):
+    if isinstance(value, str):
+        print(value)
+    elif isinstance(value, int):  # snapshot: redundant-condition-strict
+        print(value)
+```
+
+```snapshot
+error[redundant-condition-strict]: Condition is always true
+ --> src/mdtest_snippet.py:8:10
+  |
+8 |     elif isinstance(value, int):  # snapshot: redundant-condition-strict
+  |          ^^^^^^^^^^^^^^^^^^^^^^ Inferred type is `Literal[True]`
+help: Add an `else` branch that calls `assert_never`
+   |
+1  + import typing
+2  | from typing import assert_never as unreachable
+--------------------------------------------------------------------------------
+9  |     elif isinstance(value, int):  # snapshot: redundant-condition-strict
+   -         print(value)
+10 +         print(value)
+11 +     else:
+12 +         typing.assert_never(value)
+   |
+note: This is an unsafe fix and may change runtime behavior
+```
+
+## Exhaustiveness checks without a reusable variable
+
+Calling a function again could change its result or have side effects, so no fix is offered when the
+tested value is not a plain variable:
+
+```py
+def get_value() -> int:
+    return 1
+
+def exhaustive(flag: bool):
+    if flag:
+        print("flag")
+    elif isinstance(get_value(), int):  # snapshot: redundant-condition-strict
+        print("integer")
+```
+
+```snapshot
+error[redundant-condition-strict]: Condition is always true
+ --> src/mdtest_snippet.py:7:10
+  |
+7 |     elif isinstance(get_value(), int):  # snapshot: redundant-condition-strict
+  |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Inferred type is `Literal[True]`
+```
+
+## Exhaustiveness checks on Python 3.10 without dependency metadata
+
+Python 3.10 does not provide `typing.assert_never`. Bundled stubs for `typing_extensions` do not
+establish that the runtime package is available, so no fix is offered without dependency metadata:
+
+```toml
+[environment]
+python-version = "3.10"
+
+[rules]
+redundant-condition-strict = "error"
+```
+
+```py
+def exhaustive(value: str | int):
+    if isinstance(value, str):
+        print(value)
+    elif isinstance(value, int):  # snapshot: redundant-condition-strict
+        print(value)
+```
+
+```snapshot
+error[redundant-condition-strict]: Condition is always true
+ --> src/mdtest_snippet.py:4:10
+  |
+4 |     elif isinstance(value, int):  # snapshot: redundant-condition-strict
+  |          ^^^^^^^^^^^^^^^^^^^^^^ Inferred type is `Literal[True]`
+```
+
+## Exhaustiveness checks with a direct backport dependency
+
+On older Python versions, `assert_never` can be imported from `typing_extensions` when it is a
+direct dependency and the installed runtime module exports the function. Bundled stubs alone do not
+establish runtime availability:
+
+```toml
+[environment]
+python-version = "3.10"
+python = "/.venv"
+
+[rules]
+redundant-condition-strict = "error"
+
+[dependency-metadata]
+projects = [{ path = "/src", dependencies = ["extensions"] }]
+
+[dependency-metadata.distributions]
+extensions = { name = "typing-extensions" }
+
+[dependency-metadata.module-owners]
+typing_extensions = ["extensions"]
+```
+
+### Available runtime function
+
+This installed backport provides `assert_never`, so the fix can import it:
+
+`/.venv/<path-to-site-packages>/typing_extensions.py`:
+
+```py
+def assert_never(value):
+    raise AssertionError(value)
+```
+
+`main.py`:
+
+```py
+def exhaustive(value: str | int):
+    if isinstance(value, str):
+        print(value)
+    elif isinstance(value, int):  # snapshot: redundant-condition-strict
+        print(value)
+```
+
+```snapshot
+error[redundant-condition-strict]: Condition is always true
+ --> src/main.py:4:10
+  |
+4 |     elif isinstance(value, int):  # snapshot: redundant-condition-strict
+  |          ^^^^^^^^^^^^^^^^^^^^^^ Inferred type is `Literal[True]`
+help: Add an `else` branch that calls `assert_never`
+  |
+1 + from typing_extensions import assert_never
+2 | def exhaustive(value: str | int):
+3 |     if isinstance(value, str):
+4 |         print(value)
+5 |     elif isinstance(value, int):  # snapshot: redundant-condition-strict
+  -         print(value)
+6 +         print(value)
+7 +     else:
+8 +         assert_never(value)
+  |
+note: This is an unsafe fix and may change runtime behavior
+```
+
+### Older runtime module
+
+An installed backport without `assert_never` cannot provide the new assertion. No fix is offered
+even though the bundled stub includes the function:
+
+`/.venv/<path-to-site-packages>/typing_extensions.py`:
+
+```py
+```
+
+`main.py`:
+
+```py
+def exhaustive(value: str | int):
+    if isinstance(value, str):
+        print(value)
+    elif isinstance(value, int):  # snapshot: redundant-condition-strict
+        print(value)
+```
+
+```snapshot
+error[redundant-condition-strict]: Condition is always true
+ --> src/main.py:4:10
+  |
+4 |     elif isinstance(value, int):  # snapshot: redundant-condition-strict
+  |          ^^^^^^^^^^^^^^^^^^^^^^ Inferred type is `Literal[True]`
+```
+
+### Missing runtime module
+
+A dependency declaration does not establish that the backport is installed. If only ty's bundled
+stub is available, no fix is offered:
+
+`/.venv/<path-to-site-packages>/unrelated.py`:
+
+```py
+```
+
+`main.py`:
+
+```py
+def exhaustive(value: str | int):
+    if isinstance(value, str):
+        print(value)
+    elif isinstance(value, int):  # snapshot: redundant-condition-strict
+        print(value)
+```
+
+```snapshot
+error[redundant-condition-strict]: Condition is always true
+ --> src/main.py:4:10
+  |
+4 |     elif isinstance(value, int):  # snapshot: redundant-condition-strict
+  |          ^^^^^^^^^^^^^^^^^^^^^^ Inferred type is `Literal[True]`
+```
+
+## Exhaustiveness checks with an indirect backport dependency
+
+An installed but undeclared backport does not justify adding a runtime import. The containing
+workspace's declaration does not make it a direct dependency of a nested project:
+
+```toml
+[environment]
+python-version = "3.10"
+python = "/.venv"
+
+[rules]
+redundant-condition-strict = "error"
+
+[dependency-metadata]
+projects = [
+    { path = "/src", dependencies = ["extensions"] },
+    { path = "/src/member", dependencies = [] },
+]
+
+[dependency-metadata.distributions]
+extensions = { name = "typing-extensions" }
+
+[dependency-metadata.module-owners]
+typing_extensions = ["extensions"]
+```
+
+`/.venv/<path-to-site-packages>/typing_extensions.py`:
+
+```py
+def assert_never(value):
+    raise AssertionError(value)
+```
+
+`member/main.py`:
+
+```py
+def exhaustive(value: str | int):
+    if isinstance(value, str):
+        print(value)
+    elif isinstance(value, int):  # snapshot: redundant-condition-strict
+        print(value)
+```
+
+```snapshot
+error[redundant-condition-strict]: Condition is always true
+ --> src/member/main.py:4:10
+  |
+4 |     elif isinstance(value, int):  # snapshot: redundant-condition-strict
+  |          ^^^^^^^^^^^^^^^^^^^^^^ Inferred type is `Literal[True]`
+```
+
 ## `if` and `while` conditions that use AST literal bools or ints
 
 We maintain a special case for `while` loops, since `while True:` and `while 1:` are common idioms

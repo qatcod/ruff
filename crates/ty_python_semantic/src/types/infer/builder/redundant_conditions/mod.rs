@@ -332,7 +332,10 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             return None;
         }
 
-        Some(RedundantConditionChecker { builder: self })
+        Some(RedundantConditionChecker {
+            builder: self,
+            final_elif: None,
+        })
     }
 
     /// Check a condition, for which types have already been inferred, to see if it is redundant.
@@ -506,6 +509,13 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 continue;
             };
 
+            let checker = RedundantConditionChecker {
+                final_elif: elif_else_clauses
+                    .last()
+                    .filter(|clause| clause.test.is_some()),
+                ..checker
+            };
+
             let branches = std::iter::once((test.as_ref(), body.as_slice())).chain(
                 elif_else_clauses
                     .iter()
@@ -544,6 +554,9 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
 /// The [`diagnostic`] module constructs diagnostic messages and fixes.
 struct RedundantConditionChecker<'a, 'db> {
     builder: &'a TypeInferenceBuilder<'db, 'a>,
+    /// The final `elif` in the current statement, if there is no `else` branch.
+    /// Only a diagnostic on its complete test can offer an exhaustiveness-check fix.
+    final_elif: Option<&'a ast::ElifElseClause>,
 }
 
 impl<'db> RedundantConditionChecker<'_, 'db> {
@@ -794,7 +807,15 @@ impl<'db> RedundantConditionChecker<'_, 'db> {
         let rule = condition.kind.rule();
 
         if self.builder.context.is_lint_enabled(rule) && !context.exempts(self.builder, condition) {
-            self.builder.report_redundant_condition(condition);
+            self.builder.report_redundant_condition(
+                condition,
+                self.final_elif.filter(|clause| {
+                    clause
+                        .test
+                        .as_ref()
+                        .is_some_and(|test| test.range() == condition.expression.range())
+                }),
+            );
         }
     }
 
