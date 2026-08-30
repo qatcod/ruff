@@ -9,10 +9,11 @@ use super::{
     CallArguments, CallDunderError, ClassBase, ClassLiteral, GenericAlias, KnownClass,
     ModuleLiteralType, StaticClassLiteral, add_inferred_python_version_hint_to_diagnostic,
 };
+use crate::dependency::is_direct_dependency;
 use crate::diagnostic::{did_you_mean, format_enumeration};
 use crate::importer::{ImportRequest, MembersInScope};
 use crate::lint::{Level, LintRegistryBuilder, LintStatus};
-use crate::place::{DefinedPlace, Place, place_from_bindings};
+use crate::place::{DefinedPlace, Place, imported_symbol, place_from_bindings};
 use crate::suppression::FileSuppressionId;
 use crate::types::call::bind::CallableDescription;
 use crate::types::call::{Bindings, CallDiagnosticOverride, CallError};
@@ -54,7 +55,10 @@ use ruff_source_file::LineRanges;
 use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::fmt::{self, Formatter};
-use ty_module_resolver::{KnownModule, Module, ModuleName, SearchPath, file_to_module};
+use ty_module_resolver::{
+    ImportingFile, KnownModule, Module, ModuleName, SearchPath, file_to_module,
+    resolve_real_shadowable_module,
+};
 use ty_python_core::definition::{Definition, DefinitionKind, ParameterDefinitionNodeKind};
 use ty_python_core::place::{PlaceTable, ScopedPlaceId};
 use ty_python_core::{ProgramFile, global_scope, place_table, use_def_map};
@@ -3063,9 +3067,41 @@ pub(super) fn report_undefined_reveal(context: &InferContext, name: &ast::ExprNa
     diagnostic.info("This is allowed for debugging convenience but will fail at runtime");
 
     let db = context.db();
-    let module = if context.program_environment().python_version(db) >= PythonVersion::PY311 {
+    let env = context.program_environment();
+    let module = if env.python_version(db) >= PythonVersion::PY311 {
         "typing"
     } else {
+        let model = SemanticModel::new(db, context.program_file());
+        let Some(module) = model.resolve_module(Some("typing_extensions"), 0) else {
+            return;
+        };
+        // Bundled stubs make the module available for type checking even when the project
+        // does not declare it. Only add a runtime import with positive dependency evidence.
+        if !module.is_known(db, KnownModule::TypingExtensions)
+            || !is_direct_dependency(db, context.program_file(), module)
+        {
+            return;
+        }
+        // The bundled stub includes `reveal_type` even when the installed backport is too
+        // old to provide it. Check the runtime module's exports before adding a runtime import.
+        let Some(runtime_file) = resolve_real_shadowable_module(
+            db,
+            ImportingFile::File(
+                context.file(),
+                context.program_file().resolver_environment(db),
+            ),
+            &KnownModule::TypingExtensions.name(),
+        )
+        .and_then(|module| module.file(db)) else {
+            return;
+        };
+        let runtime_file = env.program(db).program_file(db, runtime_file);
+        if !imported_symbol(db, env, Some(runtime_file), "reveal_type", None)
+            .place
+            .is_definitely_bound()
+        {
+            return;
+        }
         "typing_extensions"
     };
     // `reveal_type` is unbound. Force a `from` import to avoid introducing a module name
