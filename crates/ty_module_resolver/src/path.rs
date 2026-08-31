@@ -226,6 +226,15 @@ impl ModulePath {
         }
     }
 
+    /// Returns the path within the vendored filesystem, if this is a vendored module.
+    pub(crate) fn to_vendored_path(&self) -> Option<VendoredPathBuf> {
+        Some(
+            self.search_path
+                .as_vendored_path()?
+                .join(&self.relative_path),
+        )
+    }
+
     #[must_use]
     pub(super) fn to_file(&self, resolver: &ResolverContext) -> Option<File> {
         let db = resolver.db;
